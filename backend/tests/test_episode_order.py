@@ -4,9 +4,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 
 from core.episode_order import (
+    _metadata_is_likely_anime,
     _merge_episode_media,
     ensure_episode_order_mapping,
     ensure_episode_order_mapping_for_season,
+    get_episode_order,
     get_episode_orders_for_series,
     get_tmdb_to_tvdb_positions,
     reconcile_divergent_episode_media,
@@ -801,13 +803,129 @@ class BatchedLookupTests(unittest.IsolatedAsyncioTestCase):
             UserShowEpisodeOrder(user_id=7, series_tmdb_id=200, episode_order="tmdb", tvdb_id=None),
         ]
         db = AsyncMock()
-        db.execute.return_value = _ExistingResult(rows)
+        db.execute.side_effect = [
+            _ExistingResult(rows),
+            # No personal metadata keys...
+            _ScalarOneResult(SimpleNamespace(tmdb_api_key=None, tvdb_api_key=None)),
+            # ...and no server-wide keys, so missing id 300 stays TMDB-default.
+            _ScalarOneResult(SimpleNamespace(tmdb_api_key=None, tvdb_api_key=None)),
+        ]
 
         result = await get_episode_orders_for_series(db, user_id=7, series_tmdb_ids=[100, 200, 300])
 
         self.assertEqual(set(result.keys()), {100, 200})
         self.assertEqual(result[100].episode_order, "tvdb")
         self.assertEqual(result[200].episode_order, "tmdb")
+
+    def test_anime_classifier_requires_japanese_animation(self) -> None:
+        self.assertTrue(_metadata_is_likely_anime(
+            {"original_language": "ja", "genres": ["Animation", "Drama"]}
+        ))
+        self.assertTrue(_metadata_is_likely_anime(
+            {"original_language": "ja", "genres": [{"id": 16, "name": "Animation"}]}
+        ))
+        self.assertFalse(_metadata_is_likely_anime(
+            {"original_language": "en", "genres": ["Animation"]}
+        ))
+        self.assertFalse(_metadata_is_likely_anime(
+            {"original_language": "ja", "genres": ["Drama"]}
+        ))
+
+    async def test_explicit_tmdb_override_beats_automatic_anime_default(self) -> None:
+        explicit = UserShowEpisodeOrder(
+            user_id=7, series_tmdb_id=100, episode_order="tmdb", tvdb_id=None
+        )
+        db = AsyncMock()
+        db.execute.return_value = _ScalarOneResult(explicit)
+
+        result = await get_episode_order(db, user_id=7, series_tmdb_id=100)
+
+        self.assertIs(result, explicit)
+        db.execute.assert_awaited_once()
+
+    async def test_single_lookup_automatically_prefers_tvdb_for_cached_anime(self) -> None:
+        anime = ShowModel(
+            id=1,
+            tmdb_id=100,
+            tvdb_id=None,
+            title="Anime",
+            tmdb_data={
+                "original_language": "ja",
+                "genres": ["Animation"],
+                "external_ids": {"tvdb_id": 900},
+            },
+        )
+        db = AsyncMock()
+        db.execute.side_effect = [
+            _ScalarOneResult(None),  # no explicit override
+            _ScalarOneResult(SimpleNamespace(tmdb_api_key="tmdb", tvdb_api_key="tvdb")),
+            _ScalarOneResult(anime),
+        ]
+
+        result = await get_episode_order(db, user_id=7, series_tmdb_id=100)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.episode_order, "tvdb")
+        self.assertEqual(result.tvdb_id, 900)
+        # Backfilled in-memory so the webhook's lazy mapper can use it in the
+        # same transaction without requiring a manual TVDB switch first.
+        self.assertEqual(anime.tvdb_id, 900)
+
+    async def test_single_lookup_uses_cached_tmdb_fetch_for_old_incomplete_metadata(self) -> None:
+        anime = ShowModel(
+            id=1,
+            tmdb_id=100,
+            tvdb_id=None,
+            title="Old Anime Row",
+            tmdb_data={
+                "genres": ["Animation"],
+                "external_ids": {"tvdb_id": 900},
+            },
+        )
+        db = AsyncMock()
+        db.execute.side_effect = [
+            _ScalarOneResult(None),
+            _ScalarOneResult(SimpleNamespace(tmdb_api_key="tmdb", tvdb_api_key="tvdb")),
+            _ScalarOneResult(anime),
+        ]
+        with patch(
+            "core.episode_order.tmdb.get_show",
+            AsyncMock(return_value={
+                "original_language": "ja",
+                "genres": [{"id": 16, "name": "Animation"}],
+                "external_ids": {"tvdb_id": 900},
+            }),
+        ) as get_show:
+            result = await get_episode_order(db, user_id=7, series_tmdb_id=100)
+
+        self.assertEqual(result.episode_order, "tvdb")
+        get_show.assert_awaited_once()
+
+    async def test_batch_auto_default_never_overrides_explicit_tmdb(self) -> None:
+        explicit_tmdb = UserShowEpisodeOrder(
+            user_id=7, series_tmdb_id=100, episode_order="tmdb", tvdb_id=None
+        )
+        auto_anime = ShowModel(
+            id=2,
+            tmdb_id=200,
+            tvdb_id=901,
+            title="Another Anime",
+            tmdb_data={"original_language": "ja", "genres": ["Animation"]},
+        )
+        db = AsyncMock()
+        db.execute.side_effect = [
+            _ExistingResult([explicit_tmdb]),
+            _ScalarOneResult(SimpleNamespace(tmdb_api_key="tmdb", tvdb_api_key="tvdb")),
+            _ExistingResult([auto_anime]),
+        ]
+
+        result = await get_episode_orders_for_series(
+            db, user_id=7, series_tmdb_ids=[100, 200]
+        )
+
+        self.assertEqual(result[100].episode_order, "tmdb")
+        self.assertEqual(result[200].episode_order, "tvdb")
+        self.assertEqual(result[200].tvdb_id, 901)
 
     async def test_get_episode_orders_for_series_empty_input_skips_query(self) -> None:
         db = AsyncMock()

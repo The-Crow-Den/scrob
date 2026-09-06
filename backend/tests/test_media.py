@@ -12,8 +12,13 @@ from routers import media as media_router
 from routers.media import _attach_episode_order_fields, _resolve_add_overrides, RequestOverrides
 
 
-def _pref(series_tmdb_id, episode_order="tvdb"):
-    return UserShowEpisodeOrder(user_id=1, series_tmdb_id=series_tmdb_id, episode_order=episode_order)
+def _pref(series_tmdb_id, episode_order="tvdb", tvdb_id=None):
+    return UserShowEpisodeOrder(
+        user_id=1,
+        series_tmdb_id=series_tmdb_id,
+        episode_order=episode_order,
+        tvdb_id=tvdb_id,
+    )
 
 
 def _mapping(series_tmdb_id, tmdb_season, tmdb_episode, tvdb_season, tvdb_episode):
@@ -78,6 +83,30 @@ class AttachEpisodeOrderFieldsTests(unittest.TestCase):
         self.assertEqual(item["show_episode_order"], "tvdb")
         self.assertNotIn("tvdb_season_number", item)
         self.assertNotIn("tvdb_episode_number", item)
+
+    def test_virtual_tvdb_preference_backfills_episode_show_tvdb_id(self) -> None:
+        item = {
+            "type": "episode",
+            "show_tmdb_id": 100,
+            "show_tvdb_id": None,
+            "season_number": 4,
+            "episode_number": 12,
+        }
+        episode_orders = {100: _pref(100, tvdb_id=900)}
+
+        _attach_episode_order_fields(item, episode_orders, {})
+
+        self.assertEqual(item["show_episode_order"], "tvdb")
+        self.assertEqual(item["show_tvdb_id"], 900)
+
+    def test_virtual_tvdb_preference_backfills_whole_show_tvdb_id(self) -> None:
+        item = {"type": "series", "tmdb_id": 100, "tvdb_id": None}
+        episode_orders = {100: _pref(100, tvdb_id=900)}
+
+        _attach_episode_order_fields(item, episode_orders, {})
+
+        self.assertEqual(item["show_episode_order"], "tvdb")
+        self.assertEqual(item["tvdb_id"], 900)
 
     def test_episode_with_tmdb_preference_is_a_noop(self) -> None:
         item = {"type": "episode", "show_tmdb_id": 100, "season_number": 4, "episode_number": 12}

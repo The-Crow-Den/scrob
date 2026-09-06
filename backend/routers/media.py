@@ -163,6 +163,20 @@ def _attach_episode_order_fields(
         return
     item["show_episode_order"] = "tvdb"
 
+    # Automatic anime preferences are virtual, so Show.tvdb_id may not have
+    # been persisted yet when a card/list payload is being built.  The
+    # preference itself carries the trusted TMDB cross-reference; expose it to
+    # the existing frontend link builders so whole-show, season and episode
+    # cards can route to /show/tvdb/... immediately.
+    if pref.tvdb_id:
+        if t == "series":
+            if not item.get("tvdb_id"):
+                item["tvdb_id"] = pref.tvdb_id
+            if not item.get("show_tvdb_id"):
+                item["show_tvdb_id"] = pref.tvdb_id
+        elif t == "episode" and not item.get("show_tvdb_id"):
+            item["show_tvdb_id"] = pref.tvdb_id
+
     season = item.get("season_number")
     episode = item.get("episode_number")
     # tvdb_sourced episodes (no TMDB counterpart at all) already store their
