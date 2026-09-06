@@ -9,59 +9,12 @@ jobs:
     name: Build branch image
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Apply future Next Up patch
-        if: github.actor != 'github-actions[bot]'
-        run: python tools/apply_keep_future_next_up.py
-
-      - name: Set up Python
-        if: github.actor != 'github-actions[bot]'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: backend/requirements.txt
-
-      - name: Install backend dependencies
-        if: github.actor != 'github-actions[bot]'
-        shell: bash
-        run: |
-          python -m pip install -r backend/requirements.txt \
-            'argon2-cffi>=25.1.0' \
-            'email-validator>=2.3.0' \
-            'passlib[bcrypt]>=1.7.4' \
-            'python-dateutil>=2.9.0.post0' \
-            'python-jose[cryptography]>=3.5.0' \
-            'python-multipart>=0.0.22' \
-            'xmltodict>=1.0.4' \
-            'pyotp>=2.9.0' \
-            'slowapi>=0.1.9'
-
-      - name: Run focused tests
-        if: github.actor != 'github-actions[bot]'
-        working-directory: backend
-        run: |
-          python -m unittest \
-            tests.test_history.NextUpReleaseDateEligibilityTests \
-            tests.test_history.RecentNextUpRecoveryTests \
-            tests.test_episode_order
-
-      - name: Commit validated patch
-        if: github.actor != 'github-actions[bot]'
-        shell: bash
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add backend/routers/history.py backend/tests/test_history.py
-          git diff --cached --quiet && exit 1
-          git commit -m 'feat: keep confirmed upcoming episodes in Next Up'
-          git push
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
