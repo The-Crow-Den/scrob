@@ -28,6 +28,7 @@ from core import tmdb
 from core import tvdb as tvdb_client
 from core.episode_order import (
     ensure_episode_order_mapping,
+    get_explicit_episode_order,
     get_episode_order,
     reconcile_divergent_episode_media,
     validate_episode_order,
@@ -474,7 +475,7 @@ async def _run_episode_order_mapping(
             )
             tvdb_id = mapping_summary["tvdb_id"]
 
-            preference = await get_episode_order(db, user_id, series_tmdb_id)
+            preference = await get_explicit_episode_order(db, user_id, series_tmdb_id)
             if preference:
                 preference.episode_order = "tvdb"
                 preference.tvdb_id = tvdb_id
@@ -574,7 +575,10 @@ async def set_show_episode_order(
         )
         return {"status": "started", "job_id": job.id}
 
-    preference = await get_episode_order(db, current_user.id, series_tmdb_id)
+    # This is a manual choice, so only inspect stored overrides.  Using the
+    # effective resolver here would mistake the virtual anime default for a
+    # persistent row and a manual TMDB override would never be saved.
+    preference = await get_explicit_episode_order(db, current_user.id, series_tmdb_id)
     if preference:
         preference.episode_order = selected_order
     else:
