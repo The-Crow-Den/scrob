@@ -24,10 +24,21 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: backend/requirements.txt
 
-      - name: Install backend project dependencies
-        run: python -m pip install ./backend
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          python -m pip install -r backend/requirements.txt \
+            'argon2-cffi>=25.1.0' \
+            'email-validator>=2.3.0' \
+            'passlib[bcrypt]>=1.7.4' \
+            'python-dateutil>=2.9.0.post0' \
+            'python-jose[cryptography]>=3.5.0' \
+            'python-multipart>=0.0.22' \
+            'xmltodict>=1.0.4' \
+            'pyotp>=2.9.0' \
+            'slowapi>=0.1.9'
 
       - name: Run focused tests
         working-directory: backend
