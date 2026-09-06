@@ -928,3 +928,14 @@ class RecentNextUpRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NextUpReleaseDateEligibilityTests(unittest.TestCase):
+    def test_already_aired_episode_remains_eligible(self) -> None:
+        self.assertTrue(history._has_confirmed_release_date("2026-09-01"))
+
+    def test_confirmed_future_episode_remains_eligible(self) -> None:
+        self.assertTrue(history._has_confirmed_release_date("2026-09-12"))
+
+    def test_missing_release_date_remains_hidden(self) -> None:
+        self.assertFalse(history._has_confirmed_release_date(None))
+        self.assertFalse(history._has_confirmed_release_date(""))
