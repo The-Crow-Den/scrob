@@ -826,6 +826,95 @@ def _group_last_watched(
     return last_per_show, last_watched_at
 
 
+_NEXT_UP_RECENT_REWATCH_DAYS = 14
+_NEXT_UP_BULK_BURST_SECONDS = 10
+_NEXT_UP_BULK_BURST_MIN_EPISODES = 4
+
+
+def _recent_rewatch_anchors(
+    rows: list[tuple[int, int, int, datetime, datetime, int]],
+    furthest_per_show: dict[int, tuple[int, int]],
+    *,
+    cutoff: datetime,
+) -> dict[int, tuple[int, int, datetime]]:
+    """Return short-lived anchors when a newest recent watch moved backward.
+
+    Rows are ordered newest watched_at first. The newest event is authoritative:
+    if it looks like a bulk/import burst, the show is rejected rather than
+    falling through to an older event and being resurrected.
+    """
+    by_show: dict[int, list[tuple[int, int, datetime, datetime, int]]] = {}
+    for show_id, season, episode, watched_at, created_at, media_id in rows:
+        if season is None or episode is None or watched_at is None:
+            continue
+        by_show.setdefault(show_id, []).append(
+            (season, episode, watched_at, created_at, media_id)
+        )
+
+    anchors: dict[int, tuple[int, int, datetime]] = {}
+    for show_id, events in by_show.items():
+        season, episode, watched_at, created_at, _media_id = events[0]
+        if watched_at < cutoff:
+            continue
+
+        furthest = furthest_per_show.get(show_id)
+        if furthest is None or (season, episode) >= furthest:
+            continue
+
+        if created_at is not None:
+            burst_positions = {
+                (s, e)
+                for s, e, _watched, inserted_at, _mid in events
+                if inserted_at is not None
+                and abs((inserted_at - created_at).total_seconds()) <= _NEXT_UP_BULK_BURST_SECONDS
+            }
+            if len(burst_positions) >= _NEXT_UP_BULK_BURST_MIN_EPISODES:
+                continue
+
+        anchors[show_id] = (season, episode, watched_at)
+
+    return anchors
+
+
+def _mapped_tvdb_successor(
+    series_tmdb_id: int,
+    anchor_position: tuple[int, int],
+    mappings: dict[tuple[int, int, int], EpisodeOrderMapping],
+) -> tuple[int, int] | None:
+    """Return the TMDB-side position of the immediate cached TVDB successor.
+
+    Never jump over a mapping gap. Same-season successors must be exactly +1;
+    a season transition must land on episode 1 of the next mapped official
+    season. If the cache is incomplete, recovery waits instead of guessing.
+    """
+    season, episode = anchor_position
+    anchor = mappings.get((series_tmdb_id, season, episode))
+    if not anchor or anchor.tvdb_season_number <= 0:
+        return None
+
+    candidates = sorted(
+        (
+            m for (sid, _sn, _en), m in mappings.items()
+            if sid == series_tmdb_id
+            and m.tvdb_season_number > 0
+            and (m.tvdb_season_number, m.tvdb_episode_number)
+                > (anchor.tvdb_season_number, anchor.tvdb_episode_number)
+        ),
+        key=lambda m: (m.tvdb_season_number, m.tvdb_episode_number),
+    )
+    if not candidates:
+        return None
+
+    nxt = candidates[0]
+    if nxt.tvdb_season_number == anchor.tvdb_season_number:
+        if nxt.tvdb_episode_number != anchor.tvdb_episode_number + 1:
+            return None
+    elif nxt.tvdb_episode_number != 1:
+        return None
+
+    return nxt.tmdb_season_number, nxt.tmdb_episode_number
+
+
 def _has_aired(release_date: str | None, today: date) -> bool:
     """True if release_date (ISO 8601, e.g. from TMDB air_date) is on or before
     today, or unknown. ISO 8601 strings sort lexicographically the same as their
@@ -1065,6 +1154,39 @@ async def get_next_up(
     # Keep only the furthest episode per show, and the most recent watched_at per show.
     last_per_show, last_watched_at = _group_last_watched(rows)
 
+    # Short-lived automatic rewatch signal. Only a recent backward move from
+    # the historical furthest position qualifies, so normal first-time/current
+    # progression stays entirely on the existing Next Up algorithm.
+    recent_cutoff = datetime.utcnow() - timedelta(days=_NEXT_UP_RECENT_REWATCH_DAYS)
+    recent_filters = [
+        WatchEvent.user_id == current_user.id,
+        WatchEvent.watched_at.isnot(None),
+        WatchEvent.watched_at >= recent_cutoff,
+        Media.media_type == MediaType.episode,
+        Media.show_id.isnot(None),
+        Media.season_number.isnot(None),
+        Media.episode_number.isnot(None),
+        or_(WatchEvent.completed == True, WatchEvent.progress_percent >= 0.5),
+    ]
+    if active_rewatch_show_ids:
+        recent_filters.append(Media.show_id.notin_(active_rewatch_show_ids))
+    recent_result = await db.execute(
+        select(
+            Media.show_id,
+            Media.season_number,
+            Media.episode_number,
+            WatchEvent.watched_at,
+            WatchEvent.created_at,
+            Media.id,
+        )
+        .join(WatchEvent, WatchEvent.media_id == Media.id)
+        .where(*recent_filters)
+        .order_by(desc(WatchEvent.watched_at), desc(WatchEvent.created_at), desc(WatchEvent.id))
+    )
+    recent_rewatch_anchors = _recent_rewatch_anchors(
+        recent_result.all(), last_per_show, cutoff=recent_cutoff
+    )
+
     # Step 1b: Rewatching shows - candidate position comes from that rewatch's
     # progress (furthest re-watched episode so far), defaulting to "before
     # S1E1" so a freshly-started rewatch with no progress yet still surfaces
@@ -1258,6 +1380,74 @@ async def get_next_up(
                 next_per_show[show_id] = media
             await db.commit()
 
+    # Supplemental recent-rewatch recovery. This is cache/local-row only: no
+    # provider call is made just because an old episode was revisited.
+    recent_recovery_show_ids: set[int] = set()
+    if recent_rewatch_anchors:
+        recovery_show_ids = list(recent_rewatch_anchors)
+        recovery_shows_result = await db.execute(
+            select(Show).where(Show.id.in_(recovery_show_ids))
+        )
+        recovery_shows = {s.id: s for s in recovery_shows_result.scalars().all()}
+
+        series_tmdb_ids = [
+            s.tmdb_id for s in recovery_shows.values() if s.tmdb_id is not None
+        ]
+        recovery_orders = await get_episode_orders_for_series(
+            db, current_user.id, series_tmdb_ids
+        ) if series_tmdb_ids else {}
+        tvdb_series_ids = [
+            sid for sid, pref in recovery_orders.items()
+            if pref.episode_order == "tvdb"
+        ]
+        recovery_mappings = await get_tmdb_to_tvdb_positions(
+            db, tvdb_series_ids
+        ) if tvdb_series_ids else {}
+
+        target_positions: dict[int, tuple[int, int]] = {}
+        for show_id, (season, episode, _watched_at) in recent_rewatch_anchors.items():
+            show = recovery_shows.get(show_id)
+            if not show or show.tmdb_id is None:
+                continue
+
+            pref = recovery_orders.get(show.tmdb_id)
+            if pref and pref.episode_order == "tvdb":
+                target = _mapped_tvdb_successor(
+                    show.tmdb_id, (season, episode), recovery_mappings
+                )
+            else:
+                target = _compute_next_episode(
+                    (show.tmdb_data or {}).get("seasons", []), season, episode
+                )
+            if target is not None:
+                target_positions[show_id] = target
+
+        if target_positions:
+            target_filters = [
+                and_(
+                    Media.show_id == show_id,
+                    Media.season_number == season,
+                    Media.episode_number == episode,
+                )
+                for show_id, (season, episode) in target_positions.items()
+            ]
+            recovered_result = await db.execute(
+                select(Media)
+                .options(selectinload(Media.show))
+                .where(
+                    Media.media_type == MediaType.episode,
+                    Media.tmdb_id.isnot(None),
+                    or_(*target_filters),
+                )
+                .order_by(Media.show_id, Media.id)
+            )
+            for media in recovered_result.scalars().all():
+                expected = target_positions.get(media.show_id)
+                if expected != (media.season_number, media.episode_number):
+                    continue
+                next_per_show[media.show_id] = media
+                recent_recovery_show_ids.add(media.show_id)
+
     if not next_per_show:
         return {"next_up": []}
 
@@ -1265,7 +1455,15 @@ async def get_next_up(
     # this must check that rewatch's own progress, not full history - the
     # candidate episode is very likely already in history from before the
     # rewatch started, which shouldn't hide it again.
-    non_rewatch_ids = [m.id for m in next_per_show.values() if m.show_id not in active_rewatch_show_ids]
+    recent_recovery_media_ids = {
+        m.id for show_id, m in next_per_show.items()
+        if show_id in recent_recovery_show_ids
+    }
+    non_rewatch_ids = [
+        m.id for m in next_per_show.values()
+        if m.show_id not in active_rewatch_show_ids
+        and m.id not in recent_recovery_media_ids
+    ]
     rewatch_ids = [m.id for m in next_per_show.values() if m.show_id in active_rewatch_show_ids]
 
     completed_ids: set[int] = set()

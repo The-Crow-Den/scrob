@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -858,6 +858,72 @@ class ManualSessionEpisodeShowLinkTests(unittest.IsolatedAsyncioTestCase):
         find_or_create.assert_not_awaited()
         self.assertIsNone(create_media.await_args.kwargs["show_id"])
         self.assertIsNone(media.show_id)
+
+
+class RecentNextUpRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = datetime(2026, 9, 6, 12, 0, 0)
+        self.cutoff = self.now - timedelta(days=14)
+
+    def _row(self, episode: int, *, watched_at=None, created_at=None, season=3, show_id=55, media_id=None):
+        watched_at = watched_at or self.now
+        created_at = created_at or watched_at
+        return (show_id, season, episode, watched_at, created_at, media_id or episode)
+
+    def test_recent_backward_watch_becomes_rewatch_anchor(self) -> None:
+        anchors = history._recent_rewatch_anchors(
+            [self._row(5)], {55: (3, 7)}, cutoff=self.cutoff
+        )
+        self.assertEqual(anchors[55], (3, 5, self.now))
+
+    def test_current_furthest_watch_leaves_normal_next_up_untouched(self) -> None:
+        anchors = history._recent_rewatch_anchors(
+            [self._row(7)], {55: (3, 7)}, cutoff=self.cutoff
+        )
+        self.assertEqual(anchors, {})
+
+    def test_stale_backward_watch_does_not_resurrect_show(self) -> None:
+        old = self.now - timedelta(days=15)
+        anchors = history._recent_rewatch_anchors(
+            [self._row(5, watched_at=old, created_at=old)],
+            {55: (3, 7)}, cutoff=self.cutoff,
+        )
+        self.assertEqual(anchors, {})
+
+    def test_bulk_timestamp_burst_is_not_a_rewatch_anchor(self) -> None:
+        rows = [self._row(ep, media_id=100 + ep) for ep in (5, 4, 3, 2)]
+        anchors = history._recent_rewatch_anchors(
+            rows, {55: (3, 7)}, cutoff=self.cutoff
+        )
+        self.assertEqual(anchors, {})
+
+    def test_cached_tvdb_mapping_returns_exact_immediate_successor(self) -> None:
+        anchor = EpisodeOrderMapping(
+            series_tmdb_id=100, tmdb_season_number=3, tmdb_episode_number=7,
+            tmdb_episode_id=307, tvdb_id=1007, tvdb_season_number=3,
+            tvdb_episode_number=7, match_method="external_id",
+        )
+        successor = EpisodeOrderMapping(
+            series_tmdb_id=100, tmdb_season_number=3, tmdb_episode_number=8,
+            tmdb_episode_id=308, tvdb_id=1008, tvdb_season_number=3,
+            tvdb_episode_number=8, match_method="external_id",
+        )
+        mappings = {(100, 3, 7): anchor, (100, 3, 8): successor}
+        self.assertEqual(history._mapped_tvdb_successor(100, (3, 7), mappings), (3, 8))
+
+    def test_incomplete_tvdb_mapping_never_skips_forward(self) -> None:
+        anchor = EpisodeOrderMapping(
+            series_tmdb_id=100, tmdb_season_number=3, tmdb_episode_number=7,
+            tmdb_episode_id=307, tvdb_id=1007, tvdb_season_number=3,
+            tvdb_episode_number=7, match_method="external_id",
+        )
+        gap = EpisodeOrderMapping(
+            series_tmdb_id=100, tmdb_season_number=3, tmdb_episode_number=9,
+            tmdb_episode_id=309, tvdb_id=1009, tvdb_season_number=3,
+            tvdb_episode_number=9, match_method="external_id",
+        )
+        mappings = {(100, 3, 7): anchor, (100, 3, 9): gap}
+        self.assertIsNone(history._mapped_tvdb_successor(100, (3, 7), mappings))
 
 
 if __name__ == "__main__":
