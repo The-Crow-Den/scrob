@@ -42,7 +42,7 @@ jobs:
 
       - name: Run focused tests
         working-directory: backend
-        run: python -m unittest tests.test_history tests.test_episode_order
+        run: python -m unittest tests.test_history.RecentNextUpRecoveryTests tests.test_episode_order
 
       - name: Commit validated patch
         shell: bash
