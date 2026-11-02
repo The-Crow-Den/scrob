@@ -22,6 +22,9 @@ jobs:
       - name: Install locked backend dependencies
         working-directory: backend
         run: uv sync --frozen --no-dev
+      - name: Install upstream test-only SQLite driver
+        working-directory: backend
+        run: uv pip install aiosqlite
       - name: Run fork and affected upstream tests
         working-directory: backend
         run: |
