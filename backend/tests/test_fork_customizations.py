@@ -10,7 +10,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 from core.episode_order import (
     _metadata_is_likely_anime,
     get_episode_order,
-    get_episode_orders_for_series,
+    get_effective_episode_orders_for_series,
     get_positions_for_series,
 )
 from models.episode_order import EpisodeOrderMapping, UserShowEpisodeOrder
@@ -91,7 +91,7 @@ class ForkAnimeEpisodeOrderTests(unittest.IsolatedAsyncioTestCase):
             _Result(global_settings),
             _Result([anime]),
         ]))
-        prefs = await get_episode_orders_for_series(db, 7, [100, 200])
+        prefs = await get_effective_episode_orders_for_series(db, 7, [100, 200])
         self.assertEqual(prefs[100].episode_order, "tmdb:aired")
         self.assertEqual(prefs[200].episode_order, "tvdb:official")
 
