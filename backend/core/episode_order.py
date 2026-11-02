@@ -192,7 +192,7 @@ async def get_order_keys_for_series(
     Explicit choices remain authoritative. Missing rows can receive the fork's
     cached-only Anime -> TVDB official default, with no provider fan-out.
     """
-    preferences = await get_episode_orders_for_series(db, user_id, series_tmdb_ids)
+    preferences = await get_effective_episode_orders_for_series(db, user_id, series_tmdb_ids)
     out: dict[int, str] = {}
     for sid, pref in preferences.items():
         key = normalize_order_key(pref.episode_order)
@@ -707,18 +707,32 @@ async def get_episode_orders_for_series(
     user_id: int,
     series_tmdb_ids: list[int],
 ) -> dict[int, UserShowEpisodeOrder]:
-    """Batched effective preferences; automatic Anime classification is cache-only."""
+    """Upstream-compatible explicit batch lookup.
+
+    A missing series id means there is no stored user preference. Keep this
+    helper's original one-query contract; fork-specific virtual defaults live
+    in get_effective_episode_orders_for_series.
+    """
     if not series_tmdb_ids:
         return {}
-
     result = await db.execute(
         select(UserShowEpisodeOrder).where(
             UserShowEpisodeOrder.user_id == user_id,
             UserShowEpisodeOrder.series_tmdb_id.in_(series_tmdb_ids),
         )
     )
-    preferences = {row.series_tmdb_id: row for row in result.scalars().all()}
+    return {row.series_tmdb_id: row for row in result.scalars().all()}
 
+
+async def get_effective_episode_orders_for_series(
+    db: AsyncSession,
+    user_id: int,
+    series_tmdb_ids: list[int],
+) -> dict[int, UserShowEpisodeOrder]:
+    """Explicit preferences plus cached-only automatic Anime defaults."""
+    preferences = await get_episode_orders_for_series(
+        db, user_id, series_tmdb_ids
+    )
     missing_ids = list(set(series_tmdb_ids) - set(preferences))
     if not missing_ids:
         return preferences
