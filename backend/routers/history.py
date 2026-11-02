@@ -27,7 +27,7 @@ from core.translations import get_user_metadata_language, get_media_translations
 from core.rewatch import get_active_rewatch, record_rewatch_progress, get_already_watched_for_bulk_mark, capped_season_episode_counts
 from core.watch_dedup import get_dedup_window_minutes, find_duplicate_watch_event
 from core.enrichment import create_media_safely
-from core.episode_order import get_episode_orders_for_series, get_tmdb_to_tvdb_positions
+from core.episode_order import get_effective_episode_orders_for_series, get_tmdb_to_tvdb_positions
 
 from dependencies import get_current_user, get_current_user_or_api_key
 from models.users import User
@@ -1629,7 +1629,7 @@ async def get_next_up(
             if show.tmdb_id is not None
         ]
         recovery_orders = (
-            await get_episode_orders_for_series(db, current_user.id, series_tmdb_ids)
+            await get_effective_episode_orders_for_series(db, current_user.id, series_tmdb_ids)
             if series_tmdb_ids else {}
         )
         tvdb_official_ids = [
