@@ -37,5 +37,5 @@ jobs:
           uv run python -m unittest \
             tests.test_activity_foundation \
             tests.test_webhooks \
-            tests.test_history \
-            tests.test_media
+            tests.test_media \
+            tests.test_next_up
