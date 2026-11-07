@@ -702,10 +702,16 @@ async def get_continue_watching(
     settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
     settings = settings_result.scalar_one_or_none()
     dropped_movie_ids = set(settings.dropped_movies or []) if settings else set()
+    dropped_show_ids = set(settings.dropped_shows or []) if settings else set()
 
     filters = [PlaybackProgress.user_id == current_user.id]
-    if dropped_movie_ids and not include_hidden:
-        filters.append(Media.id.notin_(dropped_movie_ids))
+    if not include_hidden:
+        if dropped_movie_ids:
+            filters.append(Media.id.notin_(dropped_movie_ids))
+        if dropped_show_ids:
+            filters.append(
+                or_(Media.show_id.is_(None), Media.show_id.notin_(dropped_show_ids))
+            )
     query = (
         select(PlaybackProgress, Media)
         .join(Media, Media.id == PlaybackProgress.media_id)
@@ -1726,6 +1732,10 @@ async def get_next_up(
         completed_ids |= {row[0] for row in rewatch_completed_result.all()}
 
     hidden_set = set(settings.next_up_hidden_shows or []) if settings else set()
+    hidden_media_keys: set[str] = set()
+    if not include_hidden:
+        from core.activity_preferences import hidden_next_up_media_keys
+        hidden_media_keys = await hidden_next_up_media_keys(db, current_user.id)
 
     today = date.today()
     await _refresh_next_episode_air_dates(
@@ -1735,6 +1745,7 @@ async def get_next_up(
         m for m in next_per_show.values()
         if m.id not in completed_ids
         and (include_hidden or (m.show_id not in hidden_set and m.show_id not in dropped_show_ids))
+        and (include_hidden or not m.media_key or m.media_key not in hidden_media_keys)
         # Keep a confirmed immediate successor visible even if its announced
         # date is still in the future, so caught-up titles stay in Next Up.
         # Undated provider placeholders remain hidden.
