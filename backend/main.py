@@ -18,6 +18,11 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from core.limiter import limiter
+from core.activity import (
+    STALE_PLAYBACK_SESSION_SWEEP_SECONDS,
+    cleanup_stale_playback_sessions,
+)
+from core.request_id import RequestIdMiddleware
 
 from sqlalchemy import or_, select, update, delete
 from models.sync import SyncJob, SyncStatus
@@ -303,6 +308,26 @@ async def _auto_sync_scheduler():
             print(f"Auto-sync scheduler error: {e}")
             import traceback
             traceback.print_exc()
+
+
+async def _stale_playback_session_cleaner():
+    """Periodically remove playback sessions whose position has not advanced."""
+    import logging
+    from db import AsyncSessionLocal
+
+    log = logging.getLogger("uvicorn.error")
+    while True:
+        await asyncio.sleep(STALE_PLAYBACK_SESSION_SWEEP_SECONDS)
+        try:
+            async with AsyncSessionLocal() as db:
+                removed = await cleanup_stale_playback_sessions(db)
+                if removed:
+                    await db.commit()
+                    log.info("Stale playback session cleaner: removed %s session(s)", removed)
+                else:
+                    await db.rollback()
+        except Exception as exc:
+            log.error("Stale playback session cleaner failed: %s", exc)
 
 
 async def _manual_session_completer():
@@ -774,7 +799,8 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Clean up stuck sync jobs and orphaned playback sessions on startup
+    # Clean up stuck sync jobs and only genuinely stale playback sessions on startup.
+    # Native Velum sessions are idempotent and must survive an ordinary Scrob restart.
     from db import async_sessionmaker
     async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with async_session() as db:
@@ -783,7 +809,7 @@ async def lifespan(app: FastAPI):
             .where(SyncJob.status.in_([SyncStatus.pending, SyncStatus.running]))
             .values(status=SyncStatus.failed, error_message="Aborted due to server restart")
         )
-        await db.execute(delete(PlaybackSession))
+        await cleanup_stale_playback_sessions(db)
         await db.commit()
         try:
             await prune_old_sync_jobs(db)
@@ -796,12 +822,18 @@ async def lifespan(app: FastAPI):
     emby_progress_task = asyncio.create_task(_emby_progress_poller())
     show_metadata_task = asyncio.create_task(_show_metadata_refresher())
     simkl_token_task = asyncio.create_task(_simkl_token_refresher())
+    stale_session_task = asyncio.create_task(_stale_playback_session_cleaner())
 
     yield
 
     simkl_token_task.cancel()
+    stale_session_task.cancel()
     try:
         await simkl_token_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await stale_session_task
     except asyncio.CancelledError:
         pass
 
@@ -842,6 +874,7 @@ app = FastAPI(title="Scrob", version=settings.app_version, lifespan=lifespan, do
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(RequestIdMiddleware)
 
 
 @app.get("/openapi.json", include_in_schema=False)
