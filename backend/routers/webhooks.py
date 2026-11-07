@@ -3526,6 +3526,21 @@ async def find_or_create_media_kodi(
 
 
 async def _handle_kodi_webhook(request: Request, db: AsyncSession, user: User):
+    """Legacy Kodi/ACME endpoint backed by the native activity pipeline.
+
+    The public webhook contract stays unchanged. Media identification and
+    outbound provider scrobbles remain Kodi-specific compatibility behavior;
+    only Scrob's local viewing-state write is shared with native Velum.
+    """
+    import hashlib
+    import re
+
+    from core.native_playback import (
+        apply_native_playback_event,
+        create_or_resume_session_for_media,
+        get_native_session,
+    )
+
     body = await request.body()
     if not body:
         return {"status": "ignored", "reason": "empty body"}
@@ -3535,15 +3550,9 @@ async def _handle_kodi_webhook(request: Request, db: AsyncSession, user: User):
     except Exception:
         return {"status": "ignored", "reason": "invalid JSON"}
 
-    # #504: Accept optional source field for API clients (Silo plugin uses
-    # this webhook but wants to identify as "silo"). Session key format stays
-    # "kodi:{user_id}:{session_id}" so Silo can still find its own sessions.
-    import re
     source = payload.get("source", "kodi")
     if not isinstance(source, str) or not re.fullmatch(r"[a-z0-9_-]{1,16}", source):
         return {"status": "error", "reason": "source must be 1-16 lowercase letters, digits, '_' or '-'"}
-    # The Kodi add-on already sends source="library_update" to flag a library
-    # mark-as-watched (see parse_kodi_payload); that is still a Kodi play.
     if source == "library_update":
         source = "kodi"
 
@@ -3553,90 +3562,128 @@ async def _handle_kodi_webhook(request: Request, db: AsyncSession, user: User):
 
     notification_type = data["notification_type"]
 
-    settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == user.id))
+    settings_result = await db.execute(
+        select(UserSettings).where(UserSettings.user_id == user.id)
+    )
     settings = settings_result.scalar_one_or_none()
-    window_minutes = dedup_window_from_settings(settings)
     tmdb_key = await _get_tmdb_key(db, settings)
 
-    media = await find_or_create_media_kodi(data, db, api_key=tmdb_key, user_id=user.id)
+    media = await find_or_create_media_kodi(
+        data, db, api_key=tmdb_key, user_id=user.id
+    )
     if media is None:
         return {"status": "ignored", "reason": "could not identify media"}
     await _backfill_kodi_runtime(db, media, data, tmdb_key)
 
-    session_key = f"kodi:{user.id}:{data['session_id']}"
+    legacy_session_id = data["session_id"]
+    duration_seconds = (
+        float(data["total_seconds"]) if data.get("total_seconds") else
+        float(media.runtime * 60) if media.runtime else None
+    )
+    now = utcnow()
 
-    if notification_type == "play":
-        session = await _get_or_open_session(db, session_key, source, user.id, media.id)
-        session.state = "playing"
-        session.updated_at = utcnow()
-        await db.commit()
-        await _maybe_trakt_scrobble(settings, media, "start", data["progress_percent"], db=db)
-        await _maybe_mdblist_scrobble(settings, media, "start", data["progress_percent"], db=db)
-        await _maybe_simkl_scrobble(settings, media, "start", data["progress_percent"], db=db)
-        await _maybe_bingebase_scrobble(settings, media, "start", data["progress_percent"], db=db)
-
-    elif notification_type == "resume":
-        session = await _get_or_open_session(db, session_key, source, user.id, media.id)
-        session.state = "playing"
-        session.progress_percent = data["progress_percent"]
-        session.progress_seconds = data["progress_seconds"]
-        session.updated_at = utcnow()
-        await db.commit()
-        await _maybe_trakt_scrobble(settings, media, "start", data["progress_percent"], db=db)
-        await _maybe_mdblist_scrobble(settings, media, "start", data["progress_percent"], db=db)
-        await _maybe_simkl_scrobble(settings, media, "start", data["progress_percent"], db=db)
-        await _maybe_bingebase_scrobble(settings, media, "start", data["progress_percent"], db=db)
-
-    elif notification_type == "pause":
-        result = await db.execute(select(PlaybackSession).where(PlaybackSession.session_key == session_key))
-        session = result.scalar_one_or_none()
-        if session:
-            session.state = "paused"
-            session.progress_percent = data["progress_percent"]
-            session.progress_seconds = data["progress_seconds"]
-            session.updated_at = utcnow()
-            await db.commit()
-        await _maybe_trakt_scrobble(settings, media, "pause", data["progress_percent"], db=db)
-        await _maybe_mdblist_scrobble(settings, media, "pause", data["progress_percent"], db=db)
-        await _maybe_bingebase_scrobble(settings, media, "pause", data["progress_percent"], db=db)
-
-    elif notification_type == "progress":
-        session = await _get_or_open_session(db, session_key, source, user.id, media.id)
-        session.state = "paused" if data["is_paused"] else "playing"
-        session.progress_percent = data["progress_percent"]
-        session.progress_seconds = data["progress_seconds"]
-        session.updated_at = utcnow()
-        await db.commit()
-
-    elif notification_type == "stop":
-        # A library mark-as-watched of something Scrob already has a play for
-        # adds nothing. Without this, Kodi echoing back a playcount Scrob just
-        # synced to it was recorded as a brand new play each time, and the
-        # growing count made the next sync write it to Kodi again, forever.
-        if data.get("library_update"):
-            already = await db.execute(
-                select(func.count()).select_from(WatchEvent).where(
-                    WatchEvent.user_id == user.id,
-                    WatchEvent.media_id == media.id,
-                )
+    # Preserve the old library-update echo suppression before it enters the
+    # common activity pipeline.
+    if notification_type == "stop" and data.get("library_update"):
+        already = await db.execute(
+            select(func.count()).select_from(WatchEvent).where(
+                WatchEvent.user_id == user.id,
+                WatchEvent.media_id == media.id,
             )
-            if already.scalar_one() > 0:
-                return {"status": "ignored", "reason": "already watched", "title": data["title"]}
+        )
+        if already.scalar_one() > 0:
+            return {
+                "status": "ignored",
+                "reason": "already watched",
+                "title": data["title"],
+            }
 
-        session = await _close_session(db, session_key)
-        progress_percent = data["progress_percent"] or (session.progress_percent if session else 0.0)
-        progress_seconds = data["progress_seconds"] or (session.progress_seconds if session else 0)
-        completed = data.get("ended") or progress_percent >= 0.90
-        if completed or progress_percent > 0.05:
-            await _write_watch_event(db, user.id, media.id, progress_percent, progress_seconds, completed, window_minutes, source=source)
-        await db.commit()
+    try:
+        session, _session_media = await get_native_session(
+            db,
+            user.id,
+            legacy_session_id,
+            session_namespace="kodi",
+        )
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        session, _session_media, _created = await create_or_resume_session_for_media(
+            db,
+            user.id,
+            session_id=legacy_session_id,
+            device_id=f"{source}-legacy",
+            media=media,
+            position_seconds=float(data.get("progress_seconds") or 0),
+            duration_seconds=duration_seconds,
+            started_at=now,
+            source=source,
+            session_namespace="kodi",
+        )
+
+    kind_map = {
+        "play": "started",
+        "resume": "resumed",
+        "pause": "paused",
+        "progress": "progress",
+        "stop": "stopped",
+    }
+    native_kind = kind_map[notification_type]
+
+    progress_percent = float(data.get("progress_percent") or 0.0)
+    if notification_type == "stop":
+        # Keep the legacy Kodi completion rule for compatibility. Native Velum
+        # itself uses the newer server threshold advertised by /v1.
+        completed = bool(data.get("ended")) or progress_percent >= 0.90
+        native_kind = "completed" if completed else "stopped"
+
+    # Exact webhook retries get the same event id. Legitimate later events get
+    # a new sequence from the already-materialized session.
+    event_id = "kodi:" + hashlib.sha256(body).hexdigest()[:48]
+    sequence = int(session.last_sequence) + 1
+
+    result = await apply_native_playback_event(
+        db,
+        session,
+        media,
+        event_id=event_id,
+        sequence=sequence,
+        kind=native_kind,
+        position_seconds=float(data.get("progress_seconds") or 0),
+        duration_seconds=duration_seconds,
+        playback_rate=None,
+        occurred_at=now,
+        event_source=source,
+    )
+
+    # Preserve all old outbound scrobble side effects. These are adapters for
+    # third-party services, not Scrob's source of truth.
+    if notification_type in {"play", "resume"}:
+        await _maybe_trakt_scrobble(settings, media, "start", progress_percent, db=db)
+        await _maybe_mdblist_scrobble(settings, media, "start", progress_percent, db=db)
+        await _maybe_simkl_scrobble(settings, media, "start", progress_percent, db=db)
+        await _maybe_bingebase_scrobble(settings, media, "start", progress_percent, db=db)
+    elif notification_type == "pause":
+        await _maybe_trakt_scrobble(settings, media, "pause", progress_percent, db=db)
+        await _maybe_mdblist_scrobble(settings, media, "pause", progress_percent, db=db)
+        await _maybe_bingebase_scrobble(settings, media, "pause", progress_percent, db=db)
+    elif notification_type == "stop":
         await _maybe_trakt_scrobble(settings, media, "stop", progress_percent, db=db)
         await _maybe_mdblist_scrobble(settings, media, "stop", progress_percent, db=db)
         await _maybe_simkl_scrobble(settings, media, "stop", progress_percent, db=db)
         await _maybe_bingebase_scrobble(settings, media, "stop", progress_percent, db=db)
         await _maybe_wetrakr_scrobble(settings, media, "stop", progress_percent, db=db)
 
-    return {"status": "ok", "event": notification_type, "title": data["title"]}
+    return {
+        "status": "ok",
+        "event": notification_type,
+        "title": data["title"],
+        "native": {
+            "duplicate": result.get("duplicate", False),
+            "stale": result.get("stale", False),
+            "revision": (result.get("state") or {}).get("revision"),
+        },
+    }
 
 
 @router.post("/kodi")
