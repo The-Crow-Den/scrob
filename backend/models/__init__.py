@@ -33,6 +33,7 @@ from .connection_push_state import ConnectionPushState
 from .oauth_device import OAuthDeviceGrant
 from .oidc_identity import OidcIdentity
 from .saved_filter import SavedFilter
+from .activity import ActivityChange, PlaybackEvent, UserActivityRevision
 
 __all__ = [
     "Base",
@@ -67,4 +68,5 @@ __all__ = [
     "ConnectionPushState",
     "OAuthDeviceGrant",
     "OidcIdentity", "SavedFilter",
+    "ActivityChange", "PlaybackEvent", "UserActivityRevision",
 ]
