@@ -10,7 +10,8 @@ from sqlalchemy.exc import IntegrityError
 
 from core import tmdb
 from core.activity import assign_media_key, canonical_media_identity
-from core.history_sync import sync_state_from_playback_session
+from core.activity_conflict import evaluate_playback_conflict
+from core.history_sync import sync_historical_completion_only, sync_state_from_playback_session
 from core.enrichment import create_media_safely, enrich_media_safely
 from core.identity import external_ids_from_tmdb, find_media, find_show, link_media_ids
 from core.timeutil import utcnow
@@ -495,8 +496,60 @@ async def apply_native_playback_event(
             "state": await materialized_session_state(db, session, media),
         }
 
+    occurred_at_naive = _naive_utc(occurred_at)
+    _clock, conflict = await evaluate_playback_conflict(
+        db, session, media, occurred_at_naive
+    )
+
+    # Event is durably accepted for idempotency/ordering even when its state
+    # effect is superseded by a later explicit mutation or playback session.
+    if conflict.block_all:
+        session.last_sequence = sequence
+        session.updated_at = utcnow()
+        await db.commit()
+        await db.refresh(session)
+        return {
+            "accepted": True,
+            "duplicate": False,
+            "stale": False,
+            "superseded": True,
+            "reason": conflict.reason,
+            "state": await materialized_session_state(db, session, media),
+        }
+
     was_completed = session.state == "completed"
     session.last_sequence = sequence
+
+    if conflict.block_current_state:
+        if kind == "completed" and not was_completed:
+            db.add(
+                WatchEvent(
+                    user_id=session.user_id,
+                    media_id=session.media_id,
+                    watched_at=occurred_at_naive,
+                    progress_seconds=int(position_seconds or session.progress_seconds or 0),
+                    progress_percent=1.0,
+                    completed=True,
+                    play_count=1,
+                    source=event_source,
+                )
+            )
+            await db.flush()
+            await sync_historical_completion_only(
+                db, session, media, occurred_at_naive
+            )
+        session.updated_at = utcnow()
+        await db.commit()
+        await db.refresh(session)
+        return {
+            "accepted": True,
+            "duplicate": False,
+            "stale": False,
+            "superseded": True,
+            "reason": conflict.reason,
+            "state": await materialized_session_state(db, session, media),
+        }
+
     if duration_seconds is not None and duration_seconds > 0:
         session.duration_seconds = float(duration_seconds)
     if playback_rate is not None and playback_rate > 0:
@@ -531,7 +584,7 @@ async def apply_native_playback_event(
                 WatchEvent(
                     user_id=session.user_id,
                     media_id=session.media_id,
-                    watched_at=_naive_utc(occurred_at),
+                    watched_at=occurred_at_naive,
                     progress_seconds=int(session.progress_seconds),
                     progress_percent=1.0,
                     completed=True,
@@ -548,7 +601,7 @@ async def apply_native_playback_event(
         session,
         media,
         completed=kind == "completed",
-        occurred_at=_naive_utc(occurred_at) if kind == "completed" else None,
+        occurred_at=occurred_at_naive if kind == "completed" else None,
     )
     await db.commit()
     await db.refresh(session)
