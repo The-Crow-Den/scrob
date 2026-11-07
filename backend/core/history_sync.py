@@ -143,8 +143,8 @@ async def format_activity_item(
         "position_seconds": float(state.position_seconds),
         "duration_seconds": state.duration_seconds,
         "play_count": int(state.play_count),
-        "last_watched_at": state.last_watched_at,
-        "updated_at": state.updated_at,
+        "last_watched_at": state.last_watched_at.isoformat() if state.last_watched_at else None,
+        "updated_at": state.updated_at.isoformat() if state.updated_at else None,
         "revision": int(state.revision),
     }
 
