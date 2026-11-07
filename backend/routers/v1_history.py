@@ -287,9 +287,6 @@ async def put_series_state(
 ):
     media = await resolve_media_key(db, media_key)
     show = await resolve_series_for_media(db, media)
-    settings = await set_series_dropped_state(
-        db, current_user.id, show=show, state=body.state
-    )
     preference, duplicate = await set_activity_preference(
         db,
         current_user.id,
@@ -306,9 +303,14 @@ async def put_series_state(
         media_key=media_key,
         show_id=show.id,
     )
+    settings = None
+    if not duplicate:
+        settings = await set_series_dropped_state(
+            db, current_user.id, show=show, state=body.state
+        )
     await db.commit()
 
-    if not duplicate and show.tmdb_id:
+    if not duplicate and settings is not None and show.tmdb_id:
         await _push_show_dropped_to_providers(
             db,
             settings,
