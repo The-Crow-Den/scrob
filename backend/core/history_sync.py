@@ -10,6 +10,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.activity import assign_media_key, canonical_media_identity, next_activity_revision
+from core.activity_conflict import note_explicit_mutation
 from core.timeutil import utcnow
 from models.activity import ActivityChange, UserActivityRevision
 from models.activity_state import ActivityState, HistoryMutation
@@ -262,6 +263,7 @@ async def apply_explicit_history_mutation(
 
     state = await ensure_activity_state(db, user_id, media)
     occurred_at = occurred_at.astimezone(timezone.utc).replace(tzinfo=None) if occurred_at.tzinfo else occurred_at
+    await note_explicit_mutation(db, user_id, media, occurred_at)
 
     # Initial Velum migration must never downgrade a remotely completed item.
     # For non-completed conflicts, keep the state with the later reliable
@@ -387,9 +389,15 @@ async def apply_explicit_history_mutation(
 
 
 async def delete_history_item(
-    db: AsyncSession, user_id: int, media: Media
+    db: AsyncSession,
+    user_id: int,
+    media: Media,
+    *,
+    occurred_at: datetime | None = None,
 ) -> int:
     media_key = assign_media_key(media)
+    occurred_at = occurred_at or utcnow()
+    await note_explicit_mutation(db, user_id, media, occurred_at)
     await db.execute(
         delete(PlaybackProgress).where(
             PlaybackProgress.user_id == user_id,
