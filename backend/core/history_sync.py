@@ -222,6 +222,29 @@ async def sync_state_from_playback_session(
     return state, snapshot
 
 
+async def sync_historical_completion_only(
+    db: AsyncSession,
+    session,
+    media: Media,
+    occurred_at: datetime,
+) -> tuple[ActivityState, dict[str, Any]]:
+    """Append-only play changed, but an older session cannot replace current progress."""
+    state = await ensure_activity_state(db, session.user_id, media)
+    play_count, last_watched = await _historical_play_data(
+        db, session.user_id, media.id
+    )
+    state.play_count = play_count
+    if last_watched is not None and (
+        state.last_watched_at is None or last_watched > state.last_watched_at
+    ):
+        state.last_watched_at = last_watched
+    revision, snapshot = await publish_activity_state(
+        db, session.user_id, state, media
+    )
+    session.activity_revision = revision
+    return state, snapshot
+
+
 async def resolve_media_key(
     db: AsyncSession, media_key: str
 ) -> Media:
@@ -263,7 +286,6 @@ async def apply_explicit_history_mutation(
 
     state = await ensure_activity_state(db, user_id, media)
     occurred_at = occurred_at.astimezone(timezone.utc).replace(tzinfo=None) if occurred_at.tzinfo else occurred_at
-    await note_explicit_mutation(db, user_id, media, occurred_at)
 
     # Initial Velum migration must never downgrade a remotely completed item.
     # For non-completed conflicts, keep the state with the later reliable
@@ -288,6 +310,8 @@ async def apply_explicit_history_mutation(
         )
         await db.commit()
         return await format_activity_item(db, state, media), False
+
+    await note_explicit_mutation(db, user_id, media, occurred_at)
     play_count, last_watched = await _historical_play_data(db, user_id, media.id)
 
     if status == "watched":
