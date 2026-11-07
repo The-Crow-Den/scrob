@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from core import tmdb
 from core.activity import assign_media_key, canonical_media_identity, record_activity_change
@@ -361,8 +362,21 @@ async def create_or_resume_native_session(
     )
     if session.duration_seconds and session.duration_seconds > 0:
         session.progress_percent = min(1.0, seconds / session.duration_seconds)
-    db.add(session)
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(session)
+            await db.flush()
+    except IntegrityError:
+        existing = (
+            await db.execute(
+                select(PlaybackSession).where(PlaybackSession.session_key == key)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        if existing.user_id != user_id or existing.media_id != media.id:
+            raise HTTPException(status_code=409, detail="session_id already belongs to different media")
+        return existing, media, False
 
     await _upsert_resume_progress(db, session)
     session.activity_revision = await record_activity_change(
@@ -424,7 +438,34 @@ async def apply_native_playback_event(
         playback_rate=playback_rate,
         occurred_at=_naive_utc(occurred_at),
     )
-    db.add(event)
+    try:
+        async with db.begin_nested():
+            db.add(event)
+            await db.flush()
+    except IntegrityError:
+        duplicate = (
+            await db.execute(
+                select(PlaybackEvent).where(
+                    PlaybackEvent.playback_session_id == session.id,
+                    PlaybackEvent.event_id == event_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if duplicate:
+            return {
+                "accepted": True,
+                "duplicate": True,
+                "stale": False,
+                "state": await materialized_session_state(db, session, media),
+            }
+        # A different event won this sequence number concurrently. Sequence is
+        # authoritative, so this request is stale rather than retryable.
+        return {
+            "accepted": False,
+            "duplicate": False,
+            "stale": True,
+            "state": await materialized_session_state(db, session, media),
+        }
 
     was_completed = session.state == "completed"
     session.last_sequence = sequence
