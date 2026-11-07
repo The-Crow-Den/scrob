@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from core import tmdb
 from core.activity import assign_media_key, canonical_media_identity
 from core.activity_conflict import evaluate_playback_conflict
-from core.history_sync import sync_historical_completion_only, sync_state_from_playback_session
+from core.history_sync import get_activity_state, sync_historical_completion_only, sync_state_from_playback_session
 from core.enrichment import create_media_safely, enrich_media_safely
 from core.identity import external_ids_from_tmdb, find_media, find_show, link_media_ids
 from core.timeutil import utcnow
@@ -256,6 +256,22 @@ async def materialized_session_state(
     session: PlaybackSession,
     media: Media,
 ) -> dict[str, Any]:
+    # Prefer the authoritative account state. This matters when the event was
+    # accepted for idempotency but superseded by an explicit mutation or a
+    # newer playback session.
+    activity = await get_activity_state(db, session.user_id, session.media_id)
+    if activity is not None:
+        return {
+            "media_key": assign_media_key(media),
+            "status": activity.status,
+            "progress_percent": round(float(activity.progress_percent) * 100, 4),
+            "position_seconds": float(activity.position_seconds),
+            "duration_seconds": activity.duration_seconds,
+            "play_count": int(activity.play_count),
+            "updated_at": activity.updated_at,
+            "revision": int(activity.revision or 0),
+        }
+
     duration = session.duration_seconds
     progress_percent = session.progress_percent
     if duration and duration > 0:
