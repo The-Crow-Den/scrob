@@ -261,9 +261,20 @@ async def apply_explicit_history_mutation(
         return await format_activity_item(db, state, media), True
 
     state = await ensure_activity_state(db, user_id, media)
+    occurred_at = occurred_at.astimezone(timezone.utc).replace(tzinfo=None) if occurred_at.tzinfo else occurred_at
 
     # Initial Velum migration must never downgrade a remotely completed item.
-    if migration_source == "velum_local_v1" and state.status == "watched" and status != "watched":
+    # For non-completed conflicts, keep the state with the later reliable
+    # timestamp. Existing state.updated_at is the best server-side timestamp
+    # available for legacy Scrob rows.
+    preserve_remote = False
+    if migration_source == "velum_local_v1":
+        if state.status == "watched" and status != "watched":
+            preserve_remote = True
+        elif state.updated_at and occurred_at < state.updated_at:
+            preserve_remote = True
+
+    if preserve_remote:
         db.add(
             HistoryMutation(
                 user_id=user_id,
@@ -275,8 +286,6 @@ async def apply_explicit_history_mutation(
         )
         await db.commit()
         return await format_activity_item(db, state, media), False
-
-    occurred_at = occurred_at.astimezone(timezone.utc).replace(tzinfo=None) if occurred_at.tzinfo else occurred_at
     play_count, last_watched = await _historical_play_data(db, user_id, media.id)
 
     if status == "watched":
