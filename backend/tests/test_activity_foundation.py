@@ -19,6 +19,7 @@ from core.activity import (
 )
 from models.base import MediaType
 from models.media import Media
+from models.playback_session import PlaybackSession
 
 
 class ActivityIdentityTests(unittest.TestCase):
@@ -57,6 +58,28 @@ class ActivityIdentityTests(unittest.TestCase):
         self.assertEqual(payload["show_ids"]["tmdb"], 100)
         self.assertEqual(payload["season"], 2)
         self.assertEqual(payload["episode"], 3)
+
+
+class PlaybackSessionProgressClockTests(unittest.TestCase):
+    def test_only_forward_progress_refreshes_last_progress_at(self):
+        session = PlaybackSession(
+            user_id=1,
+            media_id=2,
+            session_key="velum:test",
+            source="velum",
+            progress_seconds=10,
+        )
+        old = datetime(2026, 11, 7, 10, 0, 0)
+        session.last_progress_at = old
+
+        session.progress_seconds = 10
+        self.assertEqual(session.last_progress_at, old)
+
+        session.progress_seconds = 5
+        self.assertEqual(session.last_progress_at, old)
+
+        session.progress_seconds = 11
+        self.assertGreater(session.last_progress_at, old)
 
 
 class _Scalars:
