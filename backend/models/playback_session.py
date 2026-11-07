@@ -24,6 +24,7 @@ class PlaybackSession(Base):
     last_sequence    : Mapped[int]            = mapped_column(Integer, default=-1, nullable=False)
     duration_seconds : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     playback_rate    : Mapped[float]          = mapped_column(Float, default=1.0, nullable=False)
+    activity_revision : Mapped[int]            = mapped_column(Integer, default=0, nullable=False)
     state            : Mapped[str]            = mapped_column(String(16), default="playing", nullable=False)  # "playing" | "paused"
     progress_percent : Mapped[float]          = mapped_column(Float, default=0.0, nullable=False)
     progress_seconds : Mapped[int]            = mapped_column(Integer, default=0, nullable=False)
