@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from datetime import datetime, timedelta
 from typing import Optional
@@ -47,6 +48,7 @@ from core.translations import get_user_metadata_language
 from core.timeutil import utcnow
 
 router = APIRouter()
+logger = logging.getLogger("scrob.webhooks")
 
 
 async def _maybe_trakt_scrobble(
@@ -3654,6 +3656,20 @@ async def _handle_kodi_webhook(request: Request, db: AsyncSession, user: User):
         playback_rate=None,
         occurred_at=now,
         event_source=source,
+    )
+    result_state = result.get("state") or {}
+    logger.info(
+        "playback_event request_id=%s account=%s device=%s session=%s event_id=%s sequence=%s media_key=%s result=%s revision=%s source=%s",
+        getattr(request.state, "request_id", None),
+        user.id,
+        session.device_id,
+        legacy_session_id,
+        event_id,
+        sequence,
+        result_state.get("media_key"),
+        "duplicate" if result.get("duplicate") else "stale" if result.get("stale") else "superseded" if result.get("superseded") else "accepted",
+        result_state.get("revision"),
+        source,
     )
 
     # Preserve all old outbound scrobble side effects. These are adapters for
