@@ -324,19 +324,21 @@ async def _upsert_resume_progress(
         )
 
 
-async def create_or_resume_native_session(
+async def create_or_resume_session_for_media(
     db: AsyncSession,
     user_id: int,
     *,
     session_id: str,
     device_id: str,
-    media_ref: dict[str, Any],
+    media: Media,
     position_seconds: float,
     duration_seconds: float | None,
     started_at: datetime,
+    source: str = "velum",
+    session_namespace: str | None = None,
 ) -> tuple[PlaybackSession, Media, bool]:
-    media = await resolve_native_media(db, user_id, media_ref)
-    key = f"velum:{user_id}:{session_id}"
+    namespace = session_namespace or source
+    key = f"{namespace}:{user_id}:{session_id}"
     existing = (
         await db.execute(
             select(PlaybackSession).where(PlaybackSession.session_key == key)
@@ -352,7 +354,7 @@ async def create_or_resume_native_session(
         user_id=user_id,
         media_id=media.id,
         session_key=key,
-        source="velum",
+        source=source,
         device_id=device_id,
         state="playing",
         progress_seconds=seconds,
@@ -386,6 +388,32 @@ async def create_or_resume_native_session(
     return session, media, True
 
 
+async def create_or_resume_native_session(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    session_id: str,
+    device_id: str,
+    media_ref: dict[str, Any],
+    position_seconds: float,
+    duration_seconds: float | None,
+    started_at: datetime,
+) -> tuple[PlaybackSession, Media, bool]:
+    media = await resolve_native_media(db, user_id, media_ref)
+    return await create_or_resume_session_for_media(
+        db,
+        user_id,
+        session_id=session_id,
+        device_id=device_id,
+        media=media,
+        position_seconds=position_seconds,
+        duration_seconds=duration_seconds,
+        started_at=started_at,
+        source="velum",
+        session_namespace="velum",
+    )
+
+
 async def apply_native_playback_event(
     db: AsyncSession,
     session: PlaybackSession,
@@ -398,6 +426,7 @@ async def apply_native_playback_event(
     duration_seconds: float | None,
     playback_rate: float | None,
     occurred_at: datetime,
+    event_source: str = "velum",
 ) -> dict[str, Any]:
     if kind not in SUPPORTED_EVENT_KINDS:
         raise HTTPException(status_code=422, detail=f"unsupported event kind: {kind}")
@@ -507,7 +536,7 @@ async def apply_native_playback_event(
                     progress_percent=1.0,
                     completed=True,
                     play_count=1,
-                    source="velum",
+                    source=event_source,
                 )
             )
     else:
@@ -533,9 +562,13 @@ async def apply_native_playback_event(
 
 
 async def get_native_session(
-    db: AsyncSession, user_id: int, session_id: str
+    db: AsyncSession,
+    user_id: int,
+    session_id: str,
+    *,
+    session_namespace: str = "velum",
 ) -> tuple[PlaybackSession, Media]:
-    key = f"velum:{user_id}:{session_id}"
+    key = f"{session_namespace}:{user_id}:{session_id}"
     session = (
         await db.execute(
             select(PlaybackSession).where(
