@@ -17,6 +17,7 @@ class Media(Base):
         Index("idx_media_type_tmdb_rating", "media_type", "tmdb_rating"),
         Index("idx_media_tvdb_type", "tvdb_id", "media_type"),
         Index("idx_media_imdb", "imdb_id"),
+        Index("uq_media_media_key", "media_key", unique=True),
     )
 
     id             : Mapped[int]             = mapped_column(Integer, primary_key=True)
@@ -27,6 +28,9 @@ class Media(Base):
     tmdb_id        : Mapped[Optional[int]]   = mapped_column(Integer)
     tvdb_id        : Mapped[Optional[int]]   = mapped_column(Integer)
     imdb_id        : Mapped[Optional[str]]   = mapped_column(String(20))
+    # Stable opaque identity for the native viewing-activity API. Once set it
+    # never changes when later metadata enrichment adds another provider id.
+    media_key      : Mapped[Optional[str]]   = mapped_column(String(255))
     media_type     : Mapped[MediaType]       = mapped_column(Enum(MediaType), nullable=False)
     title          : Mapped[str]             = mapped_column(String(500), nullable=False)
     original_title : Mapped[Optional[str]]   = mapped_column(String(500))
