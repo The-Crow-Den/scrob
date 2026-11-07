@@ -398,8 +398,12 @@ async def create_or_resume_session_for_media(
             raise HTTPException(status_code=409, detail="session_id already belongs to different media")
         return existing, media, False
 
-    await _upsert_resume_progress(db, session)
-    await sync_state_from_playback_session(db, session, media, completed=False)
+    _clock, creation_conflict = await evaluate_playback_conflict(
+        db, session, media, session.started_at
+    )
+    if not creation_conflict.block_current_state:
+        await _upsert_resume_progress(db, session)
+        await sync_state_from_playback_session(db, session, media, completed=False)
     await db.commit()
     await db.refresh(session)
     return session, media, True
