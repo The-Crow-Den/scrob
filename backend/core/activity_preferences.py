@@ -259,6 +259,18 @@ async def resolve_series_for_media(db: AsyncSession, media: Media) -> Show:
         show = await db.get(Show, media.show_id)
         if show is not None:
             return show
+    if media.media_type == MediaType.series:
+        show = None
+        if media.tmdb_id is not None:
+            show = (
+                await db.execute(select(Show).where(Show.tmdb_id == media.tmdb_id))
+            ).scalars().first()
+        if show is None and media.tvdb_id is not None:
+            show = (
+                await db.execute(select(Show).where(Show.tvdb_id == media.tvdb_id))
+            ).scalars().first()
+        if show is not None:
+            return show
     raise HTTPException(status_code=422, detail="media_key does not resolve to a series")
 
 
