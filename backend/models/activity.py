@@ -12,6 +12,7 @@ from sqlalchemy import (
     Index,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -60,6 +61,7 @@ class ActivityChange(Base):
         nullable=True,
     )
     media_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),

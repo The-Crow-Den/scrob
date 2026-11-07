@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from core import tmdb
-from core.activity import assign_media_key, canonical_media_identity, record_activity_change
+from core.activity import assign_media_key, canonical_media_identity
+from core.history_sync import sync_state_from_playback_session
 from core.enrichment import create_media_safely, enrich_media_safely
 from core.identity import external_ids_from_tmdb, find_media, find_show, link_media_ids
 from core.timeutil import utcnow
@@ -379,9 +380,7 @@ async def create_or_resume_native_session(
         return existing, media, False
 
     await _upsert_resume_progress(db, session)
-    session.activity_revision = await record_activity_change(
-        db, user_id, operation="upsert", media=media
-    )
+    await sync_state_from_playback_session(db, session, media, completed=False)
     await db.commit()
     await db.refresh(session)
     return session, media, True
@@ -514,8 +513,13 @@ async def apply_native_playback_event(
     else:
         await _upsert_resume_progress(db, session)
 
-    session.activity_revision = await record_activity_change(
-        db, session.user_id, operation="upsert", media=media
+    await db.flush()
+    await sync_state_from_playback_session(
+        db,
+        session,
+        media,
+        completed=kind == "completed",
+        occurred_at=_naive_utc(occurred_at) if kind == "completed" else None,
     )
     await db.commit()
     await db.refresh(session)
