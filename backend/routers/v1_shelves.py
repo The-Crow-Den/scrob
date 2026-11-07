@@ -167,6 +167,7 @@ async def get_v1_next_up(
                 **_canonical_shelf_media(media, raw),
                 "reason": reason,
                 "show_last_watched_at": raw.get("show_last_watched_at"),
+                "previous_completed_at": raw.get("show_last_watched_at"),
                 "episodes_left": raw.get("episodes_left"),
                 "remaining_runtime": raw.get("remaining_runtime"),
                 "next_up_hidden": bool(raw.get("next_up_hidden")),
