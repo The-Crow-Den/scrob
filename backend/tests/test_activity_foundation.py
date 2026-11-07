@@ -10,6 +10,7 @@ os.environ.setdefault(
     "postgresql+asyncpg://test:test@localhost/test",
 )
 
+from core.request_id import RequestIdMiddleware
 from core.activity import (
     STALE_PLAYBACK_SESSION_HOURS,
     assign_media_key,
@@ -58,6 +59,37 @@ class ActivityIdentityTests(unittest.TestCase):
         self.assertEqual(payload["show_ids"]["tmdb"], 100)
         self.assertEqual(payload["season"], 2)
         self.assertEqual(payload["episode"], 3)
+
+
+class RequestIdMiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    async def test_response_gets_request_id_and_scope_state(self):
+        sent = []
+
+        async def app(scope, receive, send):
+            self.assertTrue(scope["state"]["request_id"])
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        middleware = RequestIdMiddleware(app)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/health",
+            "headers": [],
+            "state": {},
+        }
+        await middleware(scope, receive, send)
+
+        headers = dict(sent[0]["headers"])
+        self.assertIn(b"x-request-id", headers)
+        self.assertEqual(headers[b"x-request-id"].decode("ascii"), scope["state"]["request_id"])
 
 
 class PlaybackSessionProgressClockTests(unittest.TestCase):
