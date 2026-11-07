@@ -59,19 +59,17 @@ async def note_explicit_mutation(
     clock.updated_at = utcnow()
 
 
-async def evaluate_playback_conflict(
-    db: AsyncSession,
-    session: PlaybackSession,
-    media: Media,
+def decide_playback_conflict(
+    clock: ActivityConflictClock,
+    *,
+    session_started_at: datetime,
     occurred_at: datetime,
-) -> tuple[ActivityConflictClock, PlaybackConflictDecision]:
-    clock = await get_conflict_clock(db, session.user_id, media)
-
+) -> PlaybackConflictDecision:
     if (
         clock.last_explicit_mutation_at is not None
         and occurred_at <= clock.last_explicit_mutation_at
     ):
-        return clock, PlaybackConflictDecision(
+        return PlaybackConflictDecision(
             block_all=True,
             block_current_state=True,
             reason="older_than_explicit_mutation",
@@ -79,23 +77,36 @@ async def evaluate_playback_conflict(
 
     if (
         clock.last_session_started_at is not None
-        and session.started_at < clock.last_session_started_at
+        and session_started_at < clock.last_session_started_at
     ):
-        if clock.last_event_at is None or occurred_at > clock.last_event_at:
-            clock.last_event_at = occurred_at
-        clock.updated_at = utcnow()
-        return clock, PlaybackConflictDecision(
+        return PlaybackConflictDecision(
             block_current_state=True,
             reason="older_session",
         )
+    return PlaybackConflictDecision()
 
-    if (
-        clock.last_session_started_at is None
-        or session.started_at > clock.last_session_started_at
-    ):
-        clock.last_session_started_at = session.started_at
 
-    if clock.last_event_at is None or occurred_at > clock.last_event_at:
-        clock.last_event_at = occurred_at
-    clock.updated_at = utcnow()
-    return clock, PlaybackConflictDecision()
+async def evaluate_playback_conflict(
+    db: AsyncSession,
+    session: PlaybackSession,
+    media: Media,
+    occurred_at: datetime,
+) -> tuple[ActivityConflictClock, PlaybackConflictDecision]:
+    clock = await get_conflict_clock(db, session.user_id, media)
+    decision = decide_playback_conflict(
+        clock,
+        session_started_at=session.started_at,
+        occurred_at=occurred_at,
+    )
+
+    if not decision.block_all:
+        if (
+            clock.last_session_started_at is None
+            or session.started_at > clock.last_session_started_at
+        ):
+            clock.last_session_started_at = session.started_at
+        if clock.last_event_at is None or occurred_at > clock.last_event_at:
+            clock.last_event_at = occurred_at
+        clock.updated_at = utcnow()
+
+    return clock, decision
