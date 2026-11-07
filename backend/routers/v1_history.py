@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.activity_preferences import (
+    list_activity_preferences,
+    resolve_history_identity,
+    resolve_series_for_media,
+    set_activity_preference,
+    set_series_dropped_state,
+)
 from core.history_sync import (
     apply_explicit_history_mutation,
     decode_history_cursor,
@@ -23,7 +30,8 @@ from models.activity import ActivityChange
 from models.activity_state import ActivityState
 from models.media import Media
 from models.users import User
-from routers.history import _push_watch_state
+from routers.v1_playback import MediaIdentityIn
+from routers.history import _push_show_dropped_to_providers, _push_watch_state
 
 
 router = APIRouter()
@@ -37,6 +45,16 @@ class HistoryMutationIn(BaseModel):
     occurred_at: datetime
     mutation_id: str = Field(min_length=1, max_length=96)
     migration_source: str | None = Field(default=None, max_length=64)
+
+
+class NextUpPreferenceIn(BaseModel):
+    hidden: bool
+    mutation_id: str = Field(min_length=1, max_length=96)
+
+
+class SeriesStateIn(BaseModel):
+    state: Literal["active", "dropped"]
+    mutation_id: str = Field(min_length=1, max_length=96)
 
 
 @router.get("/history")
@@ -84,6 +102,7 @@ async def get_history_snapshot(
 
     return {
         "items": items,
+        "preferences": await list_activity_preferences(db, current_user.id),
         "next_cursor": next_cursor,
         "has_more": has_more,
         "latest_revision": await latest_account_revision(db, current_user.id),
@@ -113,6 +132,15 @@ async def get_history_changes(
     page = rows[:limit]
     changes = []
     for change in page:
+        if change.operation == "preference":
+            changes.append(
+                {
+                    "operation": "preference",
+                    "revision": int(change.revision),
+                    "preference": change.snapshot or {},
+                }
+            )
+            continue
         if change.operation == "delete":
             changes.append(
                 {
@@ -156,6 +184,17 @@ async def get_history_changes(
         "latest_revision": latest,
         "has_more": has_more,
     }
+
+
+@router.post("/history/resolve")
+async def resolve_history_item(
+    body: MediaIdentityIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_or_api_key),
+):
+    return await resolve_history_identity(
+        db, current_user.id, body.model_dump()
+    )
 
 
 @router.get("/history/items/{media_key}")
@@ -212,6 +251,72 @@ async def put_history_item(
         )
 
     return {"duplicate": duplicate, "item": item}
+
+
+@router.put("/history/items/{media_key}/shelves/next-up")
+async def put_next_up_preference(
+    media_key: str,
+    body: NextUpPreferenceIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_or_api_key),
+):
+    media = await resolve_media_key(db, media_key)
+    if media.media_type.value != "episode":
+        raise HTTPException(status_code=422, detail="Next Up preference requires an episode")
+
+    preference, duplicate = await set_activity_preference(
+        db,
+        current_user.id,
+        mutation_id=body.mutation_id,
+        preference_key=f"next-up:{media_key}",
+        kind="next_up_hidden",
+        value={"hidden": body.hidden},
+        media_key=media_key,
+        show_id=media.show_id,
+    )
+    await db.commit()
+    return {"duplicate": duplicate, "preference": preference}
+
+
+@router.put("/history/items/{media_key}/series-state")
+async def put_series_state(
+    media_key: str,
+    body: SeriesStateIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_or_api_key),
+):
+    media = await resolve_media_key(db, media_key)
+    show = await resolve_series_for_media(db, media)
+    settings = await set_series_dropped_state(
+        db, current_user.id, show=show, state=body.state
+    )
+    preference, duplicate = await set_activity_preference(
+        db,
+        current_user.id,
+        mutation_id=body.mutation_id,
+        preference_key=f"series-state:{show.id}",
+        kind="series_state",
+        value={
+            "state": body.state,
+            "show_ids": {
+                "tmdb": show.tmdb_id,
+                "tvdb": show.tvdb_id,
+            },
+        },
+        media_key=media_key,
+        show_id=show.id,
+    )
+    await db.commit()
+
+    if not duplicate and show.tmdb_id:
+        await _push_show_dropped_to_providers(
+            db,
+            settings,
+            show.tmdb_id,
+            remove=body.state == "active",
+        )
+
+    return {"duplicate": duplicate, "preference": preference}
 
 
 @router.delete("/history/items/{media_key}")
