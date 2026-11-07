@@ -36,6 +36,7 @@ from .saved_filter import SavedFilter
 from .activity import ActivityChange, PlaybackEvent, UserActivityRevision
 from .activity_state import ActivityState, HistoryMutation
 from .activity_preference import ActivityPreference, ActivityPreferenceMutation
+from .activity_conflict import ActivityConflictClock
 
 __all__ = [
     "Base",
@@ -73,4 +74,5 @@ __all__ = [
     "ActivityChange", "PlaybackEvent", "UserActivityRevision",
     "ActivityState", "HistoryMutation",
     "ActivityPreference", "ActivityPreferenceMutation",
+    "ActivityConflictClock",
 ]
