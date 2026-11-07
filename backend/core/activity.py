@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.timeutil import utcnow
@@ -70,8 +71,9 @@ def canonical_media_identity(media: Media, show: Any | None = None) -> dict:
 
     if _media_type_value(media) == "episode":
         show_ids: dict[str, Any] = {}
-        if show is None:
-            show = getattr(media, "show", None)
+        # Do not implicitly touch media.show here: on an AsyncSession that can
+        # trigger a lazy-load outside an await. Callers that need show IDs pass
+        # the already-loaded Show explicitly.
         if show is not None:
             if getattr(show, "tmdb_id", None) is not None:
                 show_ids["tmdb"] = show.tmdb_id
@@ -87,22 +89,24 @@ def canonical_media_identity(media: Media, show: Any | None = None) -> dict:
 
 
 async def next_activity_revision(db: AsyncSession, user_id: int) -> int:
-    """Increment and return the account activity revision under a row lock."""
-    row = (
-        await db.execute(
-            select(UserActivityRevision)
-            .where(UserActivityRevision.user_id == user_id)
-            .with_for_update()
+    """Atomically increment and return one account's activity revision.
+
+    PostgreSQL's upsert avoids the first-write race where two devices both see
+    no revision row and try to create revision 1 at the same time.
+    """
+    stmt = (
+        pg_insert(UserActivityRevision)
+        .values(user_id=user_id, revision=1)
+        .on_conflict_do_update(
+            index_elements=[UserActivityRevision.user_id],
+            set_={
+                "revision": UserActivityRevision.revision + 1,
+                "updated_at": func.now(),
+            },
         )
-    ).scalar_one_or_none()
-    if row is None:
-        row = UserActivityRevision(user_id=user_id, revision=1)
-        db.add(row)
-        await db.flush()
-        return 1
-    row.revision += 1
-    await db.flush()
-    return row.revision
+        .returning(UserActivityRevision.revision)
+    )
+    return int((await db.execute(stmt)).scalar_one())
 
 
 async def record_activity_change(
