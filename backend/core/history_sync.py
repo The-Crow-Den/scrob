@@ -356,11 +356,18 @@ async def apply_explicit_history_mutation(
         state.last_watched_at = last_watched
 
     else:
-        # Current state resets, but historical completed plays remain append-only.
+        # Match Scrob's existing explicit "unwatch item" product rule: reset
+        # current progress and remove completed plays for this item.
         await db.execute(
             delete(PlaybackProgress).where(
                 PlaybackProgress.user_id == user_id,
                 PlaybackProgress.media_id == media.id,
+            )
+        )
+        await db.execute(
+            delete(WatchEvent).where(
+                WatchEvent.user_id == user_id,
+                WatchEvent.media_id == media.id,
             )
         )
         state.status = "unwatched"
@@ -369,8 +376,8 @@ async def apply_explicit_history_mutation(
         state.duration_seconds = duration_seconds or (
             float(media.runtime * 60) if media.runtime else None
         )
-        state.play_count = play_count
-        state.last_watched_at = last_watched
+        state.play_count = 0
+        state.last_watched_at = None
 
     revision, snapshot = await publish_activity_state(db, user_id, state, media)
     db.add(
