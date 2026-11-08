@@ -14,7 +14,12 @@ from core.native_playback import (
 )
 from fastapi import HTTPException
 from models.base import MediaType
-from routers.v1_playback import PlaybackEventBatch, PlaybackEventIn, PlaybackSessionIn
+from routers.v1_playback import (
+    PlaybackEventBatch,
+    PlaybackEventIn,
+    PlaybackMultiSessionBatchIn,
+    PlaybackSessionIn,
+)
 
 
 class NativePlaybackContractTests(unittest.TestCase):
@@ -80,6 +85,61 @@ class NativePlaybackContractTests(unittest.TestCase):
                     "occurred_at": "2026-11-07T20:15:30Z",
                 }
             )
+
+
+    def test_multi_session_batch_accepts_multiple_sessions(self):
+        body = PlaybackMultiSessionBatchIn.model_validate(
+            {
+                "sessions": [
+                    {
+                        "session_id": "s1",
+                        "events": [
+                            {
+                                "event_id": "e1",
+                                "sequence": 2,
+                                "kind": "progress",
+                                "position_seconds": 20,
+                                "occurred_at": "2026-11-07T20:15:30Z",
+                            }
+                        ],
+                    },
+                    {
+                        "session_id": "s2",
+                        "events": [
+                            {
+                                "event_id": "e2",
+                                "sequence": 4,
+                                "kind": "paused",
+                                "position_seconds": 40,
+                                "playback_rate": 0,
+                                "occurred_at": "2026-11-07T20:16:30Z",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+        self.assertEqual([group.session_id for group in body.sessions], ["s1", "s2"])
+
+    def test_multi_session_batch_caps_session_count(self):
+        payload = {
+            "sessions": [
+                {
+                    "session_id": f"s{i}",
+                    "events": [
+                        {
+                            "event_id": f"e{i}",
+                            "sequence": i,
+                            "kind": "progress",
+                            "occurred_at": "2026-11-07T20:15:30Z",
+                        }
+                    ],
+                }
+                for i in range(26)
+            ]
+        }
+        with self.assertRaises(Exception):
+            PlaybackMultiSessionBatchIn.model_validate(payload)
 
 
 if __name__ == "__main__":
