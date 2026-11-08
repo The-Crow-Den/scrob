@@ -7,14 +7,12 @@ from typing import Optional
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.playback_policy import COMPLETION_THRESHOLD
 from core.session_lease import canonical_session_id, effective_position_seconds
 from core.timeutil import utcnow
 from models.activity_state import ActivityState
 from models.media import Media
 from models.playback_session import PlaybackSession
-
-
-DEFAULT_COMPLETION_THRESHOLD = 0.95
 
 
 @dataclass
@@ -41,7 +39,7 @@ def normalize_resume_position(
     position_seconds: float,
     duration_seconds: float | None,
     *,
-    completion_threshold: float = DEFAULT_COMPLETION_THRESHOLD,
+    completion_threshold: float = COMPLETION_THRESHOLD,
 ) -> tuple[float, bool]:
     position = max(0.0, float(position_seconds or 0))
     if duration_seconds is None or duration_seconds <= 0:
@@ -59,7 +57,7 @@ async def authoritative_resume(
     media: Media,
     *,
     now: datetime | None = None,
-    completion_threshold: float = DEFAULT_COMPLETION_THRESHOLD,
+    completion_threshold: float = COMPLETION_THRESHOLD,
 ) -> AuthoritativeResume:
     now = now or utcnow()
     media_key = media.media_key or f"{media.media_type.value}:scrob:{media.id}"
