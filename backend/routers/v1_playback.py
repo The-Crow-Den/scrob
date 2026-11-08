@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.resume import authoritative_resume
 from core.native_playback import (
     DEFAULT_COMPLETION_THRESHOLD,
     apply_native_playback_event,
@@ -77,6 +78,12 @@ async def create_playback_session(
         started_at=body.started_at,
     )
     state = await materialized_session_state(db, session, media)
+    resume = await authoritative_resume(
+        db,
+        current_user.id,
+        media,
+        completion_threshold=DEFAULT_COMPLETION_THRESHOLD,
+    )
     request_id = getattr(request.state, "request_id", None)
     canonical_session_id = state.get("session_id") or body.session_id
     logger.info(
@@ -94,8 +101,10 @@ async def create_playback_session(
         "resumed": not created,
         "session_id": canonical_session_id,
         "last_sequence": state.get("last_sequence", -1),
-        "resume_position_seconds": state.get("position_seconds", 0),
-        "duration_seconds": state.get("duration_seconds"),
+        "resume_position_seconds": resume.resume_position_seconds,
+        "duration_seconds": resume.duration_seconds,
+        "source_session_id": resume.source_session_id,
+        "resume_source": resume.source,
         "request_id": request_id,
         "completion_threshold": DEFAULT_COMPLETION_THRESHOLD,
         "state": state,
@@ -125,11 +134,19 @@ async def get_active_playback_session(
         )
     session, media = found
     state = await materialized_session_state(db, session, media)
+    resume = await authoritative_resume(
+        db,
+        current_user.id,
+        media,
+        completion_threshold=DEFAULT_COMPLETION_THRESHOLD,
+    )
     return {
         "session_id": state.get("session_id"),
         "last_sequence": state.get("last_sequence", -1),
-        "resume_position_seconds": state.get("position_seconds", 0),
-        "duration_seconds": state.get("duration_seconds"),
+        "resume_position_seconds": resume.resume_position_seconds,
+        "duration_seconds": resume.duration_seconds,
+        "source_session_id": resume.source_session_id,
+        "resume_source": resume.source,
         "request_id": request_id,
         "state": state,
     }
