@@ -60,6 +60,15 @@ class PlaybackEventBatch(BaseModel):
     events: list[PlaybackEventIn] = Field(min_length=1, max_length=100)
 
 
+class PlaybackSessionBatchIn(BaseModel):
+    session_id: str = Field(min_length=1, max_length=160)
+    events: list[PlaybackEventIn] = Field(min_length=1, max_length=100)
+
+
+class PlaybackMultiSessionBatchIn(BaseModel):
+    sessions: list[PlaybackSessionBatchIn] = Field(min_length=1, max_length=25)
+
+
 @router.post("/playback/sessions")
 async def create_playback_session(
     body: PlaybackSessionIn,
@@ -149,6 +158,99 @@ async def get_active_playback_session(
         "resume_source": resume.source,
         "request_id": request_id,
         "state": state,
+    }
+
+
+@router.post("/playback/events/batch")
+async def post_multi_session_playback_events(
+    body: PlaybackMultiSessionBatchIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_or_api_key),
+):
+    total_events = sum(len(group.events) for group in body.sessions)
+    if total_events > 250:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "batch_too_large",
+                "message": "at most 250 events may be submitted across one batch",
+            },
+        )
+
+    request_id = getattr(request.state, "request_id", None)
+    session_results = []
+
+    for group in body.sessions:
+        try:
+            session, media = await get_native_session(
+                db, current_user.id, group.session_id
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {
+                "code": "unknown_session",
+                "message": str(exc.detail),
+            }
+            session_results.append(
+                {
+                    "session_id": group.session_id,
+                    "accepted": False,
+                    "error_code": detail.get("code", "unknown_session"),
+                    "message": detail.get("message"),
+                    "results": [],
+                }
+            )
+            continue
+
+        results = []
+        for event in sorted(group.events, key=lambda item: item.sequence):
+            result = await apply_native_playback_event(
+                db,
+                session,
+                media,
+                event_id=event.event_id,
+                sequence=event.sequence,
+                kind=event.kind,
+                position_seconds=event.position_seconds,
+                duration_seconds=event.duration_seconds,
+                playback_rate=event.playback_rate,
+                occurred_at=event.occurred_at,
+            )
+            state = result.get("state") or {}
+            result["request_id"] = request_id
+            logger.info(
+                "playback_event request_id=%s account=%s device=%s session=%s event_id=%s sequence=%s media_key=%s result=%s revision=%s batch=multi",
+                request_id,
+                current_user.id,
+                session.device_id,
+                group.session_id,
+                event.event_id,
+                event.sequence,
+                state.get("media_key"),
+                "duplicate" if result.get("duplicate") else "stale" if result.get("stale") else "superseded" if result.get("superseded") else "rejected" if not result.get("accepted", False) else "accepted",
+                state.get("revision"),
+            )
+            results.append(
+                {
+                    "event_id": event.event_id,
+                    "sequence": event.sequence,
+                    **result,
+                }
+            )
+
+        session_results.append(
+            {
+                "session_id": group.session_id,
+                "accepted": all(result.get("accepted", False) for result in results),
+                "results": results,
+                "state": results[-1].get("state") if results else None,
+            }
+        )
+
+    return {
+        "sessions": session_results,
+        "request_id": request_id,
+        "completion_threshold": DEFAULT_COMPLETION_THRESHOLD,
     }
 
 

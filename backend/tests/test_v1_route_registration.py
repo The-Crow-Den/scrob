@@ -19,6 +19,7 @@ class NativeRouteRegistrationTests(unittest.TestCase):
             ("/v1/playback/sessions", "POST"),
             ("/v1/playback/sessions/active", "GET"),
             ("/v1/playback/sessions/{session_id}/events", "POST"),
+            ("/v1/playback/events/batch", "POST"),
             ("/v1/history/resolve", "POST"),
             ("/v1/history/continue-watching", "GET"),
             ("/v1/history/next-up", "GET"),
