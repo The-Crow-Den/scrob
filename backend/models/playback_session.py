@@ -13,6 +13,8 @@ class PlaybackSession(Base):
     __table_args__ = (
         Index("idx_playback_sessions_session_key", "session_key"),
         Index("idx_playback_sessions_last_progress_at", "last_progress_at"),
+        Index("idx_playback_sessions_user_device_media_state", "user_id", "device_id", "media_id", "state"),
+        Index("idx_playback_sessions_lease_expires_at", "lease_expires_at"),
     )
 
     id               : Mapped[int]            = mapped_column(Integer, primary_key=True)
@@ -21,6 +23,7 @@ class PlaybackSession(Base):
     session_key      : Mapped[str]            = mapped_column(String(255), nullable=False, unique=True)
     source           : Mapped[str]            = mapped_column(String(16), nullable=False)  # "plex" | "jellyfin" | "velum"
     device_id        : Mapped[Optional[str]]  = mapped_column(String(255), nullable=True)
+    client_session_id : Mapped[Optional[str]]  = mapped_column(String(160), nullable=True)
     last_sequence    : Mapped[int]            = mapped_column(Integer, default=-1, nullable=False)
     duration_seconds : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     playback_rate    : Mapped[float]          = mapped_column(Float, default=1.0, nullable=False)
@@ -30,6 +33,8 @@ class PlaybackSession(Base):
     progress_seconds : Mapped[int]            = mapped_column(Integer, default=0, nullable=False)
     started_at       : Mapped[datetime]       = mapped_column(DateTime, default=utcnow, nullable=False)
     last_progress_at : Mapped[datetime]       = mapped_column(DateTime, default=utcnow, nullable=False)
+    last_event_at    : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     updated_at       : Mapped[datetime]       = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 

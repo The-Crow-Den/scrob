@@ -15,6 +15,8 @@ from core.history_sync import get_activity_state, sync_historical_completion_onl
 from core.enrichment import create_media_safely, enrich_media_safely
 from core.identity import external_ids_from_tmdb, find_media, find_show, link_media_ids
 from core.timeutil import utcnow
+from core.playback_policy import COMPLETION_THRESHOLD
+from core.session_lease import canonical_session_id, lease_deadline, session_projection
 from models.activity import PlaybackEvent
 from models.base import MediaType
 from models.events import WatchEvent
@@ -25,7 +27,7 @@ from models.show import Show
 from routers.media import get_user_tmdb_key
 
 
-DEFAULT_COMPLETION_THRESHOLD = 0.95
+DEFAULT_COMPLETION_THRESHOLD = COMPLETION_THRESHOLD
 MIN_RESUME_PROGRESS = 0.05
 SUPPORTED_EVENT_KINDS = {
     "started",
@@ -256,20 +258,22 @@ async def materialized_session_state(
     session: PlaybackSession,
     media: Media,
 ) -> dict[str, Any]:
-    # Prefer the authoritative account state. This matters when the event was
-    # accepted for idempotency but superseded by an explicit mutation or a
-    # newer playback session.
+    # Session endpoints expose both the live session projection and the
+    # authoritative account-level activity projection.
+    projection = session_projection(session)
     activity = await get_activity_state(db, session.user_id, session.media_id)
     if activity is not None:
         return {
             "media_key": assign_media_key(media),
-            "status": activity.status,
+            "status": session.state,
+            "activity_status": activity.status,
             "progress_percent": round(float(activity.progress_percent) * 100, 4),
             "position_seconds": float(activity.position_seconds),
             "duration_seconds": activity.duration_seconds,
             "play_count": int(activity.play_count),
             "updated_at": activity.updated_at,
             "revision": int(activity.revision or 0),
+            **projection,
         }
 
     duration = session.duration_seconds
@@ -279,16 +283,17 @@ async def materialized_session_state(
             0.0,
             min(1.0, float(session.progress_seconds) / float(duration)),
         )
-    status = "watched" if session.state == "completed" else "watching"
     return {
         "media_key": assign_media_key(media),
-        "status": status,
+        "status": session.state,
+        "activity_status": "watched" if session.state == "completed" else "watching",
         "progress_percent": round(progress_percent * 100, 4),
         "position_seconds": float(session.progress_seconds),
         "duration_seconds": duration,
         "play_count": await _current_play_count(db, session.user_id, session.media_id),
         "updated_at": session.updated_at,
         "revision": int(session.activity_revision or 0),
+        **projection,
     }
 
 
@@ -356,6 +361,10 @@ async def create_or_resume_session_for_media(
 ) -> tuple[PlaybackSession, Media, bool]:
     namespace = session_namespace or source
     key = f"{namespace}:{user_id}:{session_id}"
+    now = utcnow()
+
+    # Exact client retries remain idempotent even after completion. A replay
+    # after completion must use a new logical session id.
     existing = (
         await db.execute(
             select(PlaybackSession).where(PlaybackSession.session_key == key)
@@ -363,22 +372,87 @@ async def create_or_resume_session_for_media(
     ).scalar_one_or_none()
     if existing:
         if existing.user_id != user_id or existing.media_id != media.id:
-            raise HTTPException(status_code=409, detail="session_id already belongs to different media")
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "identity_conflict", "message": "session_id already belongs to different media"},
+            )
+        if existing.client_session_id is None:
+            existing.client_session_id = session_id
+        if (
+            existing.playback_rate > 0
+            and existing.lease_expires_at is not None
+            and existing.lease_expires_at <= now
+            and existing.state == "playing"
+        ):
+            existing.playback_rate = 0.0
+            existing.state = "stale"
+            existing.lease_expires_at = None
+            await db.commit()
+            await db.refresh(existing)
         return existing, media, False
 
-    seconds = max(0, int(position_seconds or 0))
+    # Recover lost client bookkeeping by canonical identity. One unfinished
+    # user/device/media session wins; older duplicates are frozen first.
+    recoverable = (
+        await db.execute(
+            select(PlaybackSession)
+            .where(
+                PlaybackSession.user_id == user_id,
+                PlaybackSession.device_id == device_id,
+                PlaybackSession.media_id == media.id,
+                PlaybackSession.source == source,
+                PlaybackSession.state != "completed",
+            )
+            .order_by(
+                PlaybackSession.started_at.desc(),
+                PlaybackSession.updated_at.desc(),
+                PlaybackSession.id.desc(),
+            )
+        )
+    ).scalars().all()
+    if recoverable:
+        canonical = recoverable[0]
+        for older in recoverable[1:]:
+            older.playback_rate = 0.0
+            older.state = "stale"
+            older.lease_expires_at = None
+            older.updated_at = now
+        if canonical.client_session_id is None:
+            canonical.client_session_id = canonical_session_id(canonical)
+        if (
+            canonical.playback_rate > 0
+            and canonical.lease_expires_at is not None
+            and canonical.lease_expires_at <= now
+            and canonical.state == "playing"
+        ):
+            canonical.playback_rate = 0.0
+            canonical.state = "stale"
+            canonical.lease_expires_at = None
+            canonical.updated_at = now
+        await db.commit()
+        await db.refresh(canonical)
+        return canonical, media, False
+
+    seconds = max(0.0, float(position_seconds or 0))
+    duration = float(duration_seconds) if duration_seconds else None
+    if duration and duration > 0:
+        seconds = min(seconds, duration)
     session = PlaybackSession(
         user_id=user_id,
         media_id=media.id,
         session_key=key,
         source=source,
         device_id=device_id,
+        client_session_id=session_id,
         state="playing",
-        progress_seconds=seconds,
-        duration_seconds=float(duration_seconds) if duration_seconds else None,
+        progress_seconds=int(seconds),
+        duration_seconds=duration,
+        playback_rate=1.0,
         started_at=_naive_utc(started_at),
-        updated_at=utcnow(),
-        last_progress_at=utcnow(),
+        updated_at=now,
+        last_progress_at=now,
+        last_event_at=now,
+        lease_expires_at=lease_deadline(now),
     )
     if session.duration_seconds and session.duration_seconds > 0:
         session.progress_percent = min(1.0, seconds / session.duration_seconds)
@@ -395,7 +469,10 @@ async def create_or_resume_session_for_media(
         if existing is None:
             raise
         if existing.user_id != user_id or existing.media_id != media.id:
-            raise HTTPException(status_code=409, detail="session_id already belongs to different media")
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "identity_conflict", "message": "session_id already belongs to different media"},
+            )
         return existing, media, False
 
     _clock, creation_conflict = await evaluate_playback_conflict(
@@ -404,6 +481,10 @@ async def create_or_resume_session_for_media(
     if not creation_conflict.block_current_state:
         await _upsert_resume_progress(db, session)
         await sync_state_from_playback_session(db, session, media, completed=False)
+    else:
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
     await db.commit()
     await db.refresh(session)
     return session, media, True
@@ -450,7 +531,10 @@ async def apply_native_playback_event(
     event_source: str = "velum",
 ) -> dict[str, Any]:
     if kind not in SUPPORTED_EVENT_KINDS:
-        raise HTTPException(status_code=422, detail=f"unsupported event kind: {kind}")
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_event_kind", "message": f"unsupported event kind: {kind}"},
+        )
 
     duplicate = (
         await db.execute(
@@ -468,13 +552,32 @@ async def apply_native_playback_event(
             "state": await materialized_session_state(db, session, media),
         }
 
+    if session.state == "completed":
+        return {
+            "accepted": False,
+            "duplicate": False,
+            "stale": False,
+            "error_code": "session_completed",
+            "state": await materialized_session_state(db, session, media),
+        }
+
     if sequence <= session.last_sequence:
         return {
             "accepted": False,
             "duplicate": False,
             "stale": True,
+            "error_code": "stale_sequence",
             "state": await materialized_session_state(db, session, media),
         }
+
+    received_at = utcnow()
+    occurred_at_naive = _naive_utc(occurred_at)
+    # Client timestamps remain stored for audit/order, but wildly future
+    # clocks cannot become an ordering/lease oracle.
+    if occurred_at_naive > received_at:
+        occurred_for_order = received_at
+    else:
+        occurred_for_order = occurred_at_naive
 
     event = PlaybackEvent(
         user_id=session.user_id,
@@ -485,7 +588,7 @@ async def apply_native_playback_event(
         position_seconds=position_seconds,
         duration_seconds=duration_seconds,
         playback_rate=playback_rate,
-        occurred_at=_naive_utc(occurred_at),
+        occurred_at=occurred_at_naive,
     )
     try:
         async with db.begin_nested():
@@ -507,41 +610,45 @@ async def apply_native_playback_event(
                 "stale": False,
                 "state": await materialized_session_state(db, session, media),
             }
-        # A different event won this sequence number concurrently. Sequence is
-        # authoritative, so this request is stale rather than retryable.
         return {
             "accepted": False,
             "duplicate": False,
             "stale": True,
+            "error_code": "stale_sequence",
             "state": await materialized_session_state(db, session, media),
         }
 
-    occurred_at_naive = _naive_utc(occurred_at)
     _clock, conflict = await evaluate_playback_conflict(
-        db, session, media, occurred_at_naive
+        db, session, media, occurred_for_order
     )
 
-    # Event is durably accepted for idempotency/ordering even when its state
-    # effect is superseded by a later explicit mutation or playback session.
+    session.last_sequence = sequence
+    session.updated_at = received_at
+
     if conflict.block_all:
-        session.last_sequence = sequence
-        session.updated_at = utcnow()
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
         await db.commit()
         await db.refresh(session)
         return {
-            "accepted": True,
+            "accepted": False,
             "duplicate": False,
             "stale": False,
             "superseded": True,
+            "error_code": "superseded_by_mutation",
             "reason": conflict.reason,
             "state": await materialized_session_state(db, session, media),
         }
 
     was_completed = session.state == "completed"
-    session.last_sequence = sequence
 
     if conflict.block_current_state:
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
         if kind == "completed" and not was_completed:
+            session.last_event_at = received_at
             db.add(
                 WatchEvent(
                     user_id=session.user_id,
@@ -558,44 +665,94 @@ async def apply_native_playback_event(
             await sync_historical_completion_only(
                 db, session, media, occurred_at_naive
             )
-        session.updated_at = utcnow()
+            await db.commit()
+            await db.refresh(session)
+            return {
+                "accepted": True,
+                "duplicate": False,
+                "stale": False,
+                "superseded": True,
+                "reason": conflict.reason,
+                "state": await materialized_session_state(db, session, media),
+            }
+
         await db.commit()
         await db.refresh(session)
         return {
-            "accepted": True,
+            "accepted": False,
             "duplicate": False,
             "stale": False,
             "superseded": True,
+            "error_code": "superseded_session",
             "reason": conflict.reason,
             "state": await materialized_session_state(db, session, media),
         }
 
+    # Only an explicit seek may move a live session backwards. For pause/stop
+    # transport jitter we preserve the current position while still applying
+    # the terminal state transition.
+    requested_position = (
+        max(0.0, float(position_seconds))
+        if position_seconds is not None
+        else None
+    )
+    if (
+        kind == "progress"
+        and requested_position is not None
+        and requested_position < float(session.progress_seconds)
+    ):
+        await db.commit()
+        await db.refresh(session)
+        return {
+            "accepted": False,
+            "duplicate": False,
+            "stale": False,
+            "error_code": "invalid_position",
+            "state": await materialized_session_state(db, session, media),
+        }
+
+    session.last_event_at = received_at
+
     if duration_seconds is not None and duration_seconds > 0:
         session.duration_seconds = float(duration_seconds)
-    if playback_rate is not None and playback_rate > 0:
-        session.playback_rate = float(playback_rate)
-    if position_seconds is not None:
-        session.progress_seconds = max(0, int(position_seconds))
+
+    if requested_position is not None:
+        if kind == "seeked":
+            session.progress_seconds = int(requested_position)
+        else:
+            session.progress_seconds = max(
+                int(session.progress_seconds),
+                int(requested_position),
+            )
 
     if session.duration_seconds and session.duration_seconds > 0:
+        # Duration corrections recompute percentage but never move the stored
+        # absolute position backwards. Resume responses clamp invalid values.
         session.progress_percent = max(
             0.0,
             min(1.0, session.progress_seconds / session.duration_seconds),
         )
 
-    if kind in {"started", "resumed", "progress", "seeked"}:
-        session.state = "playing"
-    elif kind == "paused":
-        session.state = "paused"
-    elif kind == "stopped":
-        session.state = "stopped"
-    elif kind == "completed":
+    if kind == "completed":
         session.state = "completed"
+        session.playback_rate = 0.0
+        session.lease_expires_at = None
         if session.duration_seconds:
             session.progress_seconds = int(session.duration_seconds)
         session.progress_percent = 1.0
-
-    session.updated_at = utcnow()
+    elif kind in {"paused", "stopped"}:
+        session.state = kind
+        session.playback_rate = 0.0
+        session.lease_expires_at = None
+    else:
+        if playback_rate is not None:
+            session.playback_rate = max(0.0, float(playback_rate))
+        elif session.playback_rate <= 0 and kind in {"started", "resumed"}:
+            session.playback_rate = 1.0
+        session.state = "playing" if session.playback_rate > 0 else "paused"
+        session.lease_expires_at = (
+            lease_deadline(received_at) if session.playback_rate > 0 else None
+        )
 
     if kind == "completed":
         await _upsert_resume_progress(db, session, completed=True)
@@ -651,8 +808,65 @@ async def get_native_session(
         )
     ).scalar_one_or_none()
     if session is None:
-        raise HTTPException(status_code=404, detail="playback session not found")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "unknown_session", "message": "playback session not found"},
+        )
     media = await db.get(Media, session.media_id)
     if media is None:
-        raise HTTPException(status_code=404, detail="session media no longer exists")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "identity_conflict", "message": "session media no longer exists"},
+        )
+    return session, media
+
+
+async def get_active_native_session(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    device_id: str,
+    media_key: str,
+) -> tuple[PlaybackSession, Media] | None:
+    media = (
+        await db.execute(select(Media).where(Media.media_key == media_key))
+    ).scalar_one_or_none()
+    if media is None:
+        return None
+
+    session = (
+        await db.execute(
+            select(PlaybackSession)
+            .where(
+                PlaybackSession.user_id == user_id,
+                PlaybackSession.device_id == device_id,
+                PlaybackSession.media_id == media.id,
+                PlaybackSession.source == "velum",
+                PlaybackSession.state != "completed",
+            )
+            .order_by(
+                PlaybackSession.started_at.desc(),
+                PlaybackSession.updated_at.desc(),
+                PlaybackSession.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        return None
+
+    now = utcnow()
+    if (
+        session.playback_rate > 0
+        and session.lease_expires_at is not None
+        and session.lease_expires_at <= now
+        and session.state == "playing"
+    ):
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
+        session.updated_at = now
+        await db.commit()
+        await db.refresh(session)
+
     return session, media
