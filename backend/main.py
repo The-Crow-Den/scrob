@@ -23,6 +23,7 @@ from core.activity import (
     cleanup_stale_playback_sessions,
 )
 from core.request_id import RequestIdMiddleware
+from core.session_lease import PLAYBACK_LEASE_SWEEP_SECONDS, expire_playback_leases
 
 from sqlalchemy import or_, select, update, delete
 from models.sync import SyncJob, SyncStatus
@@ -308,6 +309,26 @@ async def _auto_sync_scheduler():
             print(f"Auto-sync scheduler error: {e}")
             import traceback
             traceback.print_exc()
+
+
+async def _playback_lease_sweeper():
+    """Freeze expired live playback leases without deleting session/history."""
+    import logging
+    from db import AsyncSessionLocal
+
+    log = logging.getLogger("uvicorn.error")
+    while True:
+        await asyncio.sleep(PLAYBACK_LEASE_SWEEP_SECONDS)
+        try:
+            async with AsyncSessionLocal() as db:
+                expired = await expire_playback_leases(db)
+                if expired:
+                    await db.commit()
+                    log.info("Playback lease sweeper: froze %s session(s)", expired)
+                else:
+                    await db.rollback()
+        except Exception as exc:
+            log.error("Playback lease sweeper failed: %s", exc)
 
 
 async def _stale_playback_session_cleaner():
@@ -823,17 +844,23 @@ async def lifespan(app: FastAPI):
     show_metadata_task = asyncio.create_task(_show_metadata_refresher())
     simkl_token_task = asyncio.create_task(_simkl_token_refresher())
     stale_session_task = asyncio.create_task(_stale_playback_session_cleaner())
+    playback_lease_task = asyncio.create_task(_playback_lease_sweeper())
 
     yield
 
     simkl_token_task.cancel()
     stale_session_task.cancel()
+    playback_lease_task.cancel()
     try:
         await simkl_token_task
     except asyncio.CancelledError:
         pass
     try:
         await stale_session_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await playback_lease_task
     except asyncio.CancelledError:
         pass
 
