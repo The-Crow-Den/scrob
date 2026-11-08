@@ -622,7 +622,6 @@ async def apply_native_playback_event(
     )
 
     session.last_sequence = sequence
-    session.last_event_at = received_at
     session.updated_at = received_at
 
     if conflict.block_all:
@@ -648,6 +647,7 @@ async def apply_native_playback_event(
         session.state = "stale"
         session.lease_expires_at = None
         if kind == "completed" and not was_completed:
+            session.last_event_at = received_at
             db.add(
                 WatchEvent(
                     user_id=session.user_id,
@@ -700,10 +700,6 @@ async def apply_native_playback_event(
         and requested_position is not None
         and requested_position < float(session.progress_seconds)
     ):
-        session.playback_rate = 0.0 if playback_rate == 0 else session.playback_rate
-        session.lease_expires_at = (
-            lease_deadline(received_at) if session.playback_rate > 0 else None
-        )
         await db.commit()
         await db.refresh(session)
         return {
@@ -713,6 +709,8 @@ async def apply_native_playback_event(
             "error_code": "invalid_position",
             "state": await materialized_session_state(db, session, media),
         }
+
+    session.last_event_at = received_at
 
     if duration_seconds is not None and duration_seconds > 0:
         session.duration_seconds = float(duration_seconds)
