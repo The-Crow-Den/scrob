@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,7 @@ from core.activity_preferences import (
     set_activity_preference,
     set_series_dropped_state,
 )
+from core.resume import authoritative_resume
 from core.history_sync import (
     apply_explicit_history_mutation,
     decode_history_cursor,
@@ -192,9 +193,12 @@ async def resolve_history_item(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_or_api_key),
 ):
-    return await resolve_history_identity(
+    item = await resolve_history_identity(
         db, current_user.id, body.model_dump()
     )
+    media = await resolve_media_key(db, item["media_key"])
+    resume = await authoritative_resume(db, current_user.id, media)
+    return {**item, **resume.as_dict()}
 
 
 @router.get("/history/items/{media_key}")
@@ -215,13 +219,16 @@ async def get_history_item(
     ).first()
     if row is None:
         raise HTTPException(status_code=404, detail="no viewing activity for media_key")
-    return await format_activity_item(db, row[0], row[1])
+    item = await format_activity_item(db, row[0], row[1])
+    resume = await authoritative_resume(db, current_user.id, row[1])
+    return {**item, **resume.as_dict()}
 
 
 @router.put("/history/items/{media_key}")
 async def put_history_item(
     media_key: str,
     body: HistoryMutationIn,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_or_api_key),
 ):
@@ -250,13 +257,18 @@ async def put_history_item(
             else None,
         )
 
-    return {"duplicate": duplicate, "item": item}
+    return {
+        "duplicate": duplicate,
+        "item": item,
+        "request_id": getattr(request.state, "request_id", None),
+    }
 
 
 @router.put("/history/items/{media_key}/shelves/next-up")
 async def put_next_up_preference(
     media_key: str,
     body: NextUpPreferenceIn,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_or_api_key),
 ):
@@ -275,13 +287,18 @@ async def put_next_up_preference(
         show_id=media.show_id,
     )
     await db.commit()
-    return {"duplicate": duplicate, "preference": preference}
+    return {
+        "duplicate": duplicate,
+        "preference": preference,
+        "request_id": getattr(request.state, "request_id", None),
+    }
 
 
 @router.put("/history/items/{media_key}/series-state")
 async def put_series_state(
     media_key: str,
     body: SeriesStateIn,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_or_api_key),
 ):
@@ -318,12 +335,17 @@ async def put_series_state(
             remove=body.state == "active",
         )
 
-    return {"duplicate": duplicate, "preference": preference}
+    return {
+        "duplicate": duplicate,
+        "preference": preference,
+        "request_id": getattr(request.state, "request_id", None),
+    }
 
 
 @router.delete("/history/items/{media_key}")
 async def delete_history_item_route(
     media_key: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_or_api_key),
 ):
@@ -334,4 +356,5 @@ async def delete_history_item_route(
         "deleted": True,
         "media_key": media_key,
         "revision": revision,
+        "request_id": getattr(request.state, "request_id", None),
     }
