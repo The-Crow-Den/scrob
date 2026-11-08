@@ -4,7 +4,7 @@ from datetime import datetime
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +12,7 @@ from core.native_playback import (
     DEFAULT_COMPLETION_THRESHOLD,
     apply_native_playback_event,
     create_or_resume_native_session,
+    get_active_native_session,
     get_native_session,
     materialized_session_state,
 )
@@ -50,7 +51,7 @@ class PlaybackEventIn(BaseModel):
     kind: str
     position_seconds: float | None = Field(default=None, ge=0)
     duration_seconds: float | None = Field(default=None, gt=0)
-    playback_rate: float | None = Field(default=None, gt=0)
+    playback_rate: float | None = Field(default=None, ge=0)
     occurred_at: datetime
 
 
@@ -76,20 +77,60 @@ async def create_playback_session(
         started_at=body.started_at,
     )
     state = await materialized_session_state(db, session, media)
+    request_id = getattr(request.state, "request_id", None)
+    canonical_session_id = state.get("session_id") or body.session_id
     logger.info(
         "playback_session request_id=%s account=%s device=%s session=%s media_key=%s result=%s revision=%s",
-        getattr(request.state, "request_id", None),
+        request_id,
         current_user.id,
         body.device_id,
-        body.session_id,
+        canonical_session_id,
         state.get("media_key"),
         "created" if created else "resumed",
         state.get("revision"),
     )
     return {
         "created": created,
-        "session_id": body.session_id,
+        "resumed": not created,
+        "session_id": canonical_session_id,
+        "last_sequence": state.get("last_sequence", -1),
+        "resume_position_seconds": state.get("position_seconds", 0),
+        "duration_seconds": state.get("duration_seconds"),
+        "request_id": request_id,
         "completion_threshold": DEFAULT_COMPLETION_THRESHOLD,
+        "state": state,
+    }
+
+
+
+@router.get("/playback/sessions/active")
+async def get_active_playback_session(
+    request: Request,
+    device_id: str = Query(..., min_length=1, max_length=255),
+    media_key: str = Query(..., min_length=1, max_length=255),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_or_api_key),
+):
+    found = await get_active_native_session(
+        db,
+        current_user.id,
+        device_id=device_id,
+        media_key=media_key,
+    )
+    request_id = getattr(request.state, "request_id", None)
+    if found is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "unknown_session", "message": "no unfinished session for device/media"},
+        )
+    session, media = found
+    state = await materialized_session_state(db, session, media)
+    return {
+        "session_id": state.get("session_id"),
+        "last_sequence": state.get("last_sequence", -1),
+        "resume_position_seconds": state.get("position_seconds", 0),
+        "duration_seconds": state.get("duration_seconds"),
+        "request_id": request_id,
         "state": state,
     }
 
@@ -136,6 +177,7 @@ async def post_playback_events(
             occurred_at=event.occurred_at,
         )
         result_state = result.get("state") or {}
+        result["request_id"] = getattr(request.state, "request_id", None)
         logger.info(
             "playback_event request_id=%s account=%s device=%s session=%s event_id=%s sequence=%s media_key=%s result=%s revision=%s",
             getattr(request.state, "request_id", None),
@@ -155,5 +197,6 @@ async def post_playback_events(
     return {
         "results": results,
         "state": results[-1]["state"] if results else await materialized_session_state(db, session, media),
+        "request_id": getattr(request.state, "request_id", None),
         "completion_threshold": DEFAULT_COMPLETION_THRESHOLD,
     }
