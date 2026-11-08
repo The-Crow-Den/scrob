@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from typing import Any
 
 from fastapi import HTTPException
@@ -26,7 +27,15 @@ from models.show import Show
 from routers.media import get_user_tmdb_key
 
 
-DEFAULT_COMPLETION_THRESHOLD = 0.95
+def _configured_completion_threshold() -> float:
+    try:
+        value = float(os.getenv("PLAYBACK_COMPLETION_THRESHOLD", "0.95"))
+    except (TypeError, ValueError):
+        value = 0.95
+    return min(1.0, max(0.5, value))
+
+
+DEFAULT_COMPLETION_THRESHOLD = _configured_completion_threshold()
 MIN_RESUME_PROGRESS = 0.05
 SUPPORTED_EVENT_KINDS = {
     "started",
@@ -734,10 +743,8 @@ async def apply_native_playback_event(
             )
 
     if session.duration_seconds and session.duration_seconds > 0:
-        session.progress_seconds = min(
-            int(session.progress_seconds),
-            int(session.duration_seconds),
-        )
+        # Duration corrections recompute percentage but never move the stored
+        # absolute position backwards. Resume responses clamp invalid values.
         session.progress_percent = max(
             0.0,
             min(1.0, session.progress_seconds / session.duration_seconds),
