@@ -811,8 +811,65 @@ async def get_native_session(
         )
     ).scalar_one_or_none()
     if session is None:
-        raise HTTPException(status_code=404, detail="playback session not found")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "unknown_session", "message": "playback session not found"},
+        )
     media = await db.get(Media, session.media_id)
     if media is None:
-        raise HTTPException(status_code=404, detail="session media no longer exists")
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "identity_conflict", "message": "session media no longer exists"},
+        )
+    return session, media
+
+
+async def get_active_native_session(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    device_id: str,
+    media_key: str,
+) -> tuple[PlaybackSession, Media] | None:
+    media = (
+        await db.execute(select(Media).where(Media.media_key == media_key))
+    ).scalar_one_or_none()
+    if media is None:
+        return None
+
+    session = (
+        await db.execute(
+            select(PlaybackSession)
+            .where(
+                PlaybackSession.user_id == user_id,
+                PlaybackSession.device_id == device_id,
+                PlaybackSession.media_id == media.id,
+                PlaybackSession.source == "velum",
+                PlaybackSession.state != "completed",
+            )
+            .order_by(
+                PlaybackSession.started_at.desc(),
+                PlaybackSession.updated_at.desc(),
+                PlaybackSession.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        return None
+
+    now = utcnow()
+    if (
+        session.playback_rate > 0
+        and session.lease_expires_at is not None
+        and session.lease_expires_at <= now
+        and session.state == "playing"
+    ):
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
+        session.updated_at = now
+        await db.commit()
+        await db.refresh(session)
+
     return session, media
