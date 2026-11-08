@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 from db import engine, Base
 import models # noqa: F401
-from routers import webhooks, media, history, ratings, sync, shows, auth, lists, oidc, profile, trakt, simkl, wetrakr, mdblist, bingebase, comments, admin, compat, export, yamtrack, calendar, saved_filters, v1_playback, v1_history
+from routers import webhooks, media, history, ratings, sync, shows, auth, lists, oidc, profile, trakt, simkl, wetrakr, mdblist, bingebase, comments, admin, compat, export, yamtrack, calendar, saved_filters, v1_playback, v1_history, v1_shelves
 
 from core.access_log import install as install_access_log_redaction
 install_access_log_redaction()
@@ -952,6 +952,7 @@ app.include_router(calendar.router, prefix="/calendar", tags=["calendar"])
 app.include_router(saved_filters.router, prefix="/saved-filters", tags=["saved-filters"])
 app.include_router(v1_playback.router, prefix="/v1", tags=["v1-playback"])
 app.include_router(v1_history.router, prefix="/v1", tags=["v1-history"])
+app.include_router(v1_shelves.router, prefix="/v1", tags=["v1-shelves"])
 app.include_router(compat.router, tags=["compat"])
 
 @app.get("/health")
