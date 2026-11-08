@@ -17,10 +17,34 @@ from models.activity_state import ActivityState, HistoryMutation
 from models.events import WatchEvent
 from models.media import Media
 from models.playback_progress import PlaybackProgress
+from models.playback_session import PlaybackSession
 from models.show import Show
 
 
 VALID_HISTORY_STATUSES = {"unwatched", "watching", "watched"}
+
+
+async def freeze_sessions_for_reset(
+    db: AsyncSession,
+    user_id: int,
+    media_id: int,
+) -> None:
+    """Make pre-reset sessions non-recoverable and unable to recreate state."""
+    rows = (
+        await db.execute(
+            select(PlaybackSession).where(
+                PlaybackSession.user_id == user_id,
+                PlaybackSession.media_id == media_id,
+                PlaybackSession.state.notin_(["completed", "reset"]),
+            )
+        )
+    ).scalars().all()
+    now = utcnow()
+    for session in rows:
+        session.playback_rate = 0.0
+        session.state = "reset"
+        session.lease_expires_at = None
+        session.updated_at = now
 
 
 def encode_history_cursor(updated_at: datetime, media_id: int) -> str:
@@ -382,6 +406,7 @@ async def apply_explicit_history_mutation(
         state.last_watched_at = last_watched
 
     else:
+        await freeze_sessions_for_reset(db, user_id, media.id)
         # Match Scrob's existing explicit "unwatch item" product rule: reset
         # current progress and remove completed plays for this item.
         await db.execute(
@@ -429,6 +454,7 @@ async def delete_history_item(
     media_key = assign_media_key(media)
     occurred_at = occurred_at or utcnow()
     await note_explicit_mutation(db, user_id, media, occurred_at)
+    await freeze_sessions_for_reset(db, user_id, media.id)
     await db.execute(
         delete(PlaybackProgress).where(
             PlaybackProgress.user_id == user_id,

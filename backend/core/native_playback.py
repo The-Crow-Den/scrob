@@ -401,7 +401,7 @@ async def create_or_resume_session_for_media(
                 PlaybackSession.device_id == device_id,
                 PlaybackSession.media_id == media.id,
                 PlaybackSession.source == source,
-                PlaybackSession.state != "completed",
+                PlaybackSession.state.notin_(["completed", "reset"]),
             )
             .order_by(
                 PlaybackSession.started_at.desc(),
@@ -549,6 +549,15 @@ async def apply_native_playback_event(
             "accepted": True,
             "duplicate": True,
             "stale": False,
+            "state": await materialized_session_state(db, session, media),
+        }
+
+    if session.state == "reset":
+        return {
+            "accepted": False,
+            "duplicate": False,
+            "stale": False,
+            "error_code": "session_reset",
             "state": await materialized_session_state(db, session, media),
         }
 
@@ -842,7 +851,7 @@ async def get_active_native_session(
                 PlaybackSession.device_id == device_id,
                 PlaybackSession.media_id == media.id,
                 PlaybackSession.source == "velum",
-                PlaybackSession.state != "completed",
+                PlaybackSession.state.notin_(["completed", "reset"]),
             )
             .order_by(
                 PlaybackSession.started_at.desc(),
