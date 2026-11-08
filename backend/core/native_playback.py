@@ -15,6 +15,7 @@ from core.history_sync import get_activity_state, sync_historical_completion_onl
 from core.enrichment import create_media_safely, enrich_media_safely
 from core.identity import external_ids_from_tmdb, find_media, find_show, link_media_ids
 from core.timeutil import utcnow
+from core.session_lease import canonical_session_id, lease_deadline, session_projection
 from models.activity import PlaybackEvent
 from models.base import MediaType
 from models.events import WatchEvent
@@ -256,20 +257,22 @@ async def materialized_session_state(
     session: PlaybackSession,
     media: Media,
 ) -> dict[str, Any]:
-    # Prefer the authoritative account state. This matters when the event was
-    # accepted for idempotency but superseded by an explicit mutation or a
-    # newer playback session.
+    # Session endpoints expose both the live session projection and the
+    # authoritative account-level activity projection.
+    projection = session_projection(session)
     activity = await get_activity_state(db, session.user_id, session.media_id)
     if activity is not None:
         return {
             "media_key": assign_media_key(media),
-            "status": activity.status,
+            "status": session.state,
+            "activity_status": activity.status,
             "progress_percent": round(float(activity.progress_percent) * 100, 4),
             "position_seconds": float(activity.position_seconds),
             "duration_seconds": activity.duration_seconds,
             "play_count": int(activity.play_count),
             "updated_at": activity.updated_at,
             "revision": int(activity.revision or 0),
+            **projection,
         }
 
     duration = session.duration_seconds
@@ -279,16 +282,17 @@ async def materialized_session_state(
             0.0,
             min(1.0, float(session.progress_seconds) / float(duration)),
         )
-    status = "watched" if session.state == "completed" else "watching"
     return {
         "media_key": assign_media_key(media),
-        "status": status,
+        "status": session.state,
+        "activity_status": "watched" if session.state == "completed" else "watching",
         "progress_percent": round(progress_percent * 100, 4),
         "position_seconds": float(session.progress_seconds),
         "duration_seconds": duration,
         "play_count": await _current_play_count(db, session.user_id, session.media_id),
         "updated_at": session.updated_at,
         "revision": int(session.activity_revision or 0),
+        **projection,
     }
 
 
