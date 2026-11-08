@@ -360,6 +360,10 @@ async def create_or_resume_session_for_media(
 ) -> tuple[PlaybackSession, Media, bool]:
     namespace = session_namespace or source
     key = f"{namespace}:{user_id}:{session_id}"
+    now = utcnow()
+
+    # Exact client retries remain idempotent even after completion. A replay
+    # after completion must use a new logical session id.
     existing = (
         await db.execute(
             select(PlaybackSession).where(PlaybackSession.session_key == key)
@@ -367,22 +371,87 @@ async def create_or_resume_session_for_media(
     ).scalar_one_or_none()
     if existing:
         if existing.user_id != user_id or existing.media_id != media.id:
-            raise HTTPException(status_code=409, detail="session_id already belongs to different media")
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "identity_conflict", "message": "session_id already belongs to different media"},
+            )
+        if existing.client_session_id is None:
+            existing.client_session_id = session_id
+        if (
+            existing.playback_rate > 0
+            and existing.lease_expires_at is not None
+            and existing.lease_expires_at <= now
+            and existing.state == "playing"
+        ):
+            existing.playback_rate = 0.0
+            existing.state = "stale"
+            existing.lease_expires_at = None
+            await db.commit()
+            await db.refresh(existing)
         return existing, media, False
 
-    seconds = max(0, int(position_seconds or 0))
+    # Recover lost client bookkeeping by canonical identity. One unfinished
+    # user/device/media session wins; older duplicates are frozen first.
+    recoverable = (
+        await db.execute(
+            select(PlaybackSession)
+            .where(
+                PlaybackSession.user_id == user_id,
+                PlaybackSession.device_id == device_id,
+                PlaybackSession.media_id == media.id,
+                PlaybackSession.source == source,
+                PlaybackSession.state != "completed",
+            )
+            .order_by(
+                PlaybackSession.started_at.desc(),
+                PlaybackSession.updated_at.desc(),
+                PlaybackSession.id.desc(),
+            )
+        )
+    ).scalars().all()
+    if recoverable:
+        canonical = recoverable[0]
+        for older in recoverable[1:]:
+            older.playback_rate = 0.0
+            older.state = "stale"
+            older.lease_expires_at = None
+            older.updated_at = now
+        if canonical.client_session_id is None:
+            canonical.client_session_id = canonical_session_id(canonical)
+        if (
+            canonical.playback_rate > 0
+            and canonical.lease_expires_at is not None
+            and canonical.lease_expires_at <= now
+            and canonical.state == "playing"
+        ):
+            canonical.playback_rate = 0.0
+            canonical.state = "stale"
+            canonical.lease_expires_at = None
+            canonical.updated_at = now
+        await db.commit()
+        await db.refresh(canonical)
+        return canonical, media, False
+
+    seconds = max(0.0, float(position_seconds or 0))
+    duration = float(duration_seconds) if duration_seconds else None
+    if duration and duration > 0:
+        seconds = min(seconds, duration)
     session = PlaybackSession(
         user_id=user_id,
         media_id=media.id,
         session_key=key,
         source=source,
         device_id=device_id,
+        client_session_id=session_id,
         state="playing",
-        progress_seconds=seconds,
-        duration_seconds=float(duration_seconds) if duration_seconds else None,
+        progress_seconds=int(seconds),
+        duration_seconds=duration,
+        playback_rate=1.0,
         started_at=_naive_utc(started_at),
-        updated_at=utcnow(),
-        last_progress_at=utcnow(),
+        updated_at=now,
+        last_progress_at=now,
+        last_event_at=now,
+        lease_expires_at=lease_deadline(now),
     )
     if session.duration_seconds and session.duration_seconds > 0:
         session.progress_percent = min(1.0, seconds / session.duration_seconds)
@@ -399,7 +468,10 @@ async def create_or_resume_session_for_media(
         if existing is None:
             raise
         if existing.user_id != user_id or existing.media_id != media.id:
-            raise HTTPException(status_code=409, detail="session_id already belongs to different media")
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "identity_conflict", "message": "session_id already belongs to different media"},
+            )
         return existing, media, False
 
     _clock, creation_conflict = await evaluate_playback_conflict(
@@ -408,6 +480,10 @@ async def create_or_resume_session_for_media(
     if not creation_conflict.block_current_state:
         await _upsert_resume_progress(db, session)
         await sync_state_from_playback_session(db, session, media, completed=False)
+    else:
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
     await db.commit()
     await db.refresh(session)
     return session, media, True
