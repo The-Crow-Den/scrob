@@ -39,13 +39,20 @@ def effective_position_seconds(
     return max(0.0, position)
 
 
+def canonical_session_id(session: PlaybackSession) -> str:
+    if session.client_session_id:
+        return session.client_session_id
+    parts = (session.session_key or "").split(":", 2)
+    return parts[2] if len(parts) == 3 else session.session_key
+
+
 def session_projection(
     session: PlaybackSession,
     *,
     now: datetime | None = None,
 ) -> dict:
     return {
-        "session_id": session.client_session_id,
+        "session_id": canonical_session_id(session),
         "status": session.state,
         "playback_rate": float(session.playback_rate or 0.0),
         "last_sequence": int(session.last_sequence),
