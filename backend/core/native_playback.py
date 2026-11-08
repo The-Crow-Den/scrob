@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import os
 from typing import Any
 
 from fastapi import HTTPException
@@ -16,6 +15,7 @@ from core.history_sync import get_activity_state, sync_historical_completion_onl
 from core.enrichment import create_media_safely, enrich_media_safely
 from core.identity import external_ids_from_tmdb, find_media, find_show, link_media_ids
 from core.timeutil import utcnow
+from core.playback_policy import COMPLETION_THRESHOLD
 from core.session_lease import canonical_session_id, lease_deadline, session_projection
 from models.activity import PlaybackEvent
 from models.base import MediaType
@@ -27,15 +27,7 @@ from models.show import Show
 from routers.media import get_user_tmdb_key
 
 
-def _configured_completion_threshold() -> float:
-    try:
-        value = float(os.getenv("PLAYBACK_COMPLETION_THRESHOLD", "0.95"))
-    except (TypeError, ValueError):
-        value = 0.95
-    return min(1.0, max(0.5, value))
-
-
-DEFAULT_COMPLETION_THRESHOLD = _configured_completion_threshold()
+DEFAULT_COMPLETION_THRESHOLD = COMPLETION_THRESHOLD
 MIN_RESUME_PROGRESS = 0.05
 SUPPORTED_EVENT_KINDS = {
     "started",
