@@ -43,6 +43,15 @@ def upgrade() -> None:
         WHERE last_event_at IS NULL
         """
     )
+    op.execute(
+        """
+        UPDATE playback_sessions
+        SET lease_expires_at = last_event_at + INTERVAL '90 seconds'
+        WHERE playback_rate > 0
+          AND state = 'playing'
+          AND lease_expires_at IS NULL
+        """
+    )
     op.create_index(
         "idx_playback_sessions_user_device_media_state",
         "playback_sessions",
