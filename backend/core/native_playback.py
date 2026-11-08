@@ -530,7 +530,10 @@ async def apply_native_playback_event(
     event_source: str = "velum",
 ) -> dict[str, Any]:
     if kind not in SUPPORTED_EVENT_KINDS:
-        raise HTTPException(status_code=422, detail=f"unsupported event kind: {kind}")
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_event_kind", "message": f"unsupported event kind: {kind}"},
+        )
 
     duplicate = (
         await db.execute(
@@ -548,13 +551,32 @@ async def apply_native_playback_event(
             "state": await materialized_session_state(db, session, media),
         }
 
+    if session.state == "completed":
+        return {
+            "accepted": False,
+            "duplicate": False,
+            "stale": False,
+            "error_code": "session_completed",
+            "state": await materialized_session_state(db, session, media),
+        }
+
     if sequence <= session.last_sequence:
         return {
             "accepted": False,
             "duplicate": False,
             "stale": True,
+            "error_code": "stale_sequence",
             "state": await materialized_session_state(db, session, media),
         }
+
+    received_at = utcnow()
+    occurred_at_naive = _naive_utc(occurred_at)
+    # Client timestamps remain stored for audit/order, but wildly future
+    # clocks cannot become an ordering/lease oracle.
+    if occurred_at_naive > received_at:
+        occurred_for_order = received_at
+    else:
+        occurred_for_order = occurred_at_naive
 
     event = PlaybackEvent(
         user_id=session.user_id,
@@ -565,7 +587,7 @@ async def apply_native_playback_event(
         position_seconds=position_seconds,
         duration_seconds=duration_seconds,
         playback_rate=playback_rate,
-        occurred_at=_naive_utc(occurred_at),
+        occurred_at=occurred_at_naive,
     )
     try:
         async with db.begin_nested():
@@ -587,40 +609,44 @@ async def apply_native_playback_event(
                 "stale": False,
                 "state": await materialized_session_state(db, session, media),
             }
-        # A different event won this sequence number concurrently. Sequence is
-        # authoritative, so this request is stale rather than retryable.
         return {
             "accepted": False,
             "duplicate": False,
             "stale": True,
+            "error_code": "stale_sequence",
             "state": await materialized_session_state(db, session, media),
         }
 
-    occurred_at_naive = _naive_utc(occurred_at)
     _clock, conflict = await evaluate_playback_conflict(
-        db, session, media, occurred_at_naive
+        db, session, media, occurred_for_order
     )
 
-    # Event is durably accepted for idempotency/ordering even when its state
-    # effect is superseded by a later explicit mutation or playback session.
+    session.last_sequence = sequence
+    session.last_event_at = received_at
+    session.updated_at = received_at
+
     if conflict.block_all:
-        session.last_sequence = sequence
-        session.updated_at = utcnow()
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
         await db.commit()
         await db.refresh(session)
         return {
-            "accepted": True,
+            "accepted": False,
             "duplicate": False,
             "stale": False,
             "superseded": True,
+            "error_code": "superseded_by_mutation",
             "reason": conflict.reason,
             "state": await materialized_session_state(db, session, media),
         }
 
     was_completed = session.state == "completed"
-    session.last_sequence = sequence
 
     if conflict.block_current_state:
+        session.playback_rate = 0.0
+        session.state = "stale"
+        session.lease_expires_at = None
         if kind == "completed" and not was_completed:
             db.add(
                 WatchEvent(
@@ -638,44 +664,98 @@ async def apply_native_playback_event(
             await sync_historical_completion_only(
                 db, session, media, occurred_at_naive
             )
-        session.updated_at = utcnow()
+            await db.commit()
+            await db.refresh(session)
+            return {
+                "accepted": True,
+                "duplicate": False,
+                "stale": False,
+                "superseded": True,
+                "reason": conflict.reason,
+                "state": await materialized_session_state(db, session, media),
+            }
+
         await db.commit()
         await db.refresh(session)
         return {
-            "accepted": True,
+            "accepted": False,
             "duplicate": False,
             "stale": False,
             "superseded": True,
+            "error_code": "superseded_session",
             "reason": conflict.reason,
+            "state": await materialized_session_state(db, session, media),
+        }
+
+    # Only an explicit seek may move a live session backwards. For pause/stop
+    # transport jitter we preserve the current position while still applying
+    # the terminal state transition.
+    requested_position = (
+        max(0.0, float(position_seconds))
+        if position_seconds is not None
+        else None
+    )
+    if (
+        kind == "progress"
+        and requested_position is not None
+        and requested_position < float(session.progress_seconds)
+    ):
+        session.playback_rate = 0.0 if playback_rate == 0 else session.playback_rate
+        session.lease_expires_at = (
+            lease_deadline(received_at) if session.playback_rate > 0 else None
+        )
+        await db.commit()
+        await db.refresh(session)
+        return {
+            "accepted": False,
+            "duplicate": False,
+            "stale": False,
+            "error_code": "invalid_position",
             "state": await materialized_session_state(db, session, media),
         }
 
     if duration_seconds is not None and duration_seconds > 0:
         session.duration_seconds = float(duration_seconds)
-    if playback_rate is not None and playback_rate > 0:
-        session.playback_rate = float(playback_rate)
-    if position_seconds is not None:
-        session.progress_seconds = max(0, int(position_seconds))
+
+    if requested_position is not None:
+        if kind == "seeked":
+            session.progress_seconds = int(requested_position)
+        else:
+            session.progress_seconds = max(
+                int(session.progress_seconds),
+                int(requested_position),
+            )
 
     if session.duration_seconds and session.duration_seconds > 0:
+        session.progress_seconds = min(
+            int(session.progress_seconds),
+            int(session.duration_seconds),
+        )
         session.progress_percent = max(
             0.0,
             min(1.0, session.progress_seconds / session.duration_seconds),
         )
 
-    if kind in {"started", "resumed", "progress", "seeked"}:
-        session.state = "playing"
-    elif kind == "paused":
-        session.state = "paused"
-    elif kind == "stopped":
-        session.state = "stopped"
-    elif kind == "completed":
+    if kind == "completed":
         session.state = "completed"
+        session.playback_rate = 0.0
+        session.lease_expires_at = None
         if session.duration_seconds:
             session.progress_seconds = int(session.duration_seconds)
         session.progress_percent = 1.0
-
-    session.updated_at = utcnow()
+    elif kind in {"paused", "stopped"}:
+        session.state = kind
+        session.playback_rate = 0.0
+        session.lease_expires_at = None
+    else:
+        if playback_rate is not None:
+            session.playback_rate = max(0.0, float(playback_rate))
+        elif session.playback_rate <= 0 and kind in {"started", "resumed"}:
+            session.playback_rate = 1.0
+        session.state = "playing" if session.playback_rate > 0 else "paused"
+        session.lease_expires_at = (
+            lease_deadline(received_at) if session.playback_rate > 0 else None
+        )
 
     if kind == "completed":
         await _upsert_resume_progress(db, session, completed=True)
