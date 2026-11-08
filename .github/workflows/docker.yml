@@ -1,8 +1,7 @@
 name: Branch build
 
 on:
-  push:
-    branches-ignore: [main]
+  workflow_dispatch:
 
 jobs:
   build:
