@@ -8,13 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from core.activity import assign_media_key, canonical_media_identity
+from core.activity_preferences import hidden_next_up_media_keys
 from core.history_sync import latest_account_revision
 from core.timeutil import utcnow
 from db import get_db
 from dependencies import get_current_user_or_api_key
 from models.media import Media
 from models.rewatch import ShowRewatch
-from models.users import User
+from models.users import User, UserSettings
 from routers.history import get_continue_watching, get_next_up
 
 
@@ -79,11 +80,20 @@ async def get_v1_continue_watching(
         db, [row["media"]["id"] for row in rows if row.get("media", {}).get("id")]
     )
 
+    settings = (
+        await db.execute(
+            select(UserSettings).where(UserSettings.user_id == current_user.id)
+        )
+    ).scalar_one_or_none()
+    dropped_show_ids = set(settings.dropped_shows or []) if settings else set()
+
     items = []
     for row in rows:
         raw = row["media"]
         media = media_map.get(raw.get("id"))
         if media is None:
+            continue
+        if media.show_id in dropped_show_ids:
             continue
         items.append(
             {
@@ -133,10 +143,17 @@ async def get_v1_next_up(
     )
     today = date.today().isoformat()
 
+    hidden_media_keys = (
+        await hidden_next_up_media_keys(db, current_user.id)
+        if not include_hidden else set()
+    )
+
     items = []
     for raw in rows:
         media = media_map.get(raw.get("id"))
         if media is None:
+            continue
+        if media.media_key in hidden_media_keys:
             continue
         if media.show_id in rewatch_show_ids:
             reason = "resume_series"
@@ -150,6 +167,7 @@ async def get_v1_next_up(
                 **_canonical_shelf_media(media, raw),
                 "reason": reason,
                 "show_last_watched_at": raw.get("show_last_watched_at"),
+                "previous_completed_at": raw.get("show_last_watched_at"),
                 "episodes_left": raw.get("episodes_left"),
                 "remaining_runtime": raw.get("remaining_runtime"),
                 "next_up_hidden": bool(raw.get("next_up_hidden")),
